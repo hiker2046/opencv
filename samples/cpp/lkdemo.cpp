@@ -1,6 +1,7 @@
 #include "opencv2/video/tracking.hpp"
-#include "opencv2/imgproc/imgproc.hpp"
-#include "opencv2/highgui/highgui.hpp"
+#include "opencv2/imgproc.hpp"
+#include "opencv2/videoio.hpp"
+#include "opencv2/highgui.hpp"
 
 #include <iostream>
 #include <ctype.h>
@@ -12,9 +13,8 @@ static void help()
 {
     // print a welcome message, and the OpenCV version
     cout << "\nThis is a demo of Lukas-Kanade optical flow lkdemo(),\n"
-            "Using OpenCV version %s\n" << CV_VERSION << "\n"
-            << endl;
-
+            "Using OpenCV version " << CV_VERSION << endl;
+    cout << "\nIt uses camera by default, but you can provide a path to video as an argument.\n";
     cout << "\nHot keys: \n"
             "\tESC - quit the program\n"
             "\tr - auto-initialize tracking\n"
@@ -28,9 +28,9 @@ bool addRemovePt = false;
 
 static void onMouse( int event, int x, int y, int /*flags*/, void* /*param*/ )
 {
-    if( event == CV_EVENT_LBUTTONDOWN )
+    if( event == EVENT_LBUTTONDOWN )
     {
-        point = Point2f((float)x,(float)y);
+        point = Point2f((float)x, (float)y);
         addRemovePt = true;
     }
 }
@@ -38,17 +38,21 @@ static void onMouse( int event, int x, int y, int /*flags*/, void* /*param*/ )
 int main( int argc, char** argv )
 {
     VideoCapture cap;
-    TermCriteria termcrit(CV_TERMCRIT_ITER|CV_TERMCRIT_EPS,20,0.03);
+    TermCriteria termcrit(TermCriteria::COUNT|TermCriteria::EPS,20,0.03);
     Size subPixWinSize(10,10), winSize(31,31);
 
     const int MAX_COUNT = 500;
     bool needToInit = false;
     bool nightMode = false;
 
-    if( argc == 1 || (argc == 2 && strlen(argv[1]) == 1 && isdigit(argv[1][0])))
-        cap.open(argc == 2 ? argv[1][0] - '0' : 0);
-    else if( argc == 2 )
-        cap.open(argv[1]);
+    help();
+    cv::CommandLineParser parser(argc, argv, "{@input|0|}");
+    string input = parser.get<string>("@input");
+
+    if( input.size() == 1 && isdigit(input[0]) )
+        cap.open(input[0] - '0');
+    else
+        cap.open(input);
 
     if( !cap.isOpened() )
     {
@@ -56,23 +60,20 @@ int main( int argc, char** argv )
         return 0;
     }
 
-    help();
-
     namedWindow( "LK Demo", 1 );
     setMouseCallback( "LK Demo", onMouse, 0 );
 
-    Mat gray, prevGray, image;
+    Mat gray, prevGray, image, frame;
     vector<Point2f> points[2];
 
     for(;;)
     {
-        Mat frame;
         cap >> frame;
         if( frame.empty() )
             break;
 
         frame.copyTo(image);
-        cvtColor(image, gray, CV_BGR2GRAY);
+        cvtColor(image, gray, COLOR_BGR2GRAY);
 
         if( nightMode )
             image = Scalar::all(0);
@@ -80,7 +81,7 @@ int main( int argc, char** argv )
         if( needToInit )
         {
             // automatic initialization
-            goodFeaturesToTrack(gray, points[1], MAX_COUNT, 0.01, 10, Mat(), 3, 0, 0.04);
+            goodFeaturesToTrack(gray, points[1], MAX_COUNT, 0.01, 10, Mat(), 3, 3, 0, 0.04);
             cornerSubPix(gray, points[1], subPixWinSize, Size(-1,-1), termcrit);
             addRemovePt = false;
         }
@@ -117,7 +118,7 @@ int main( int argc, char** argv )
         {
             vector<Point2f> tmp;
             tmp.push_back(point);
-            cornerSubPix( gray, tmp, winSize, cvSize(-1,-1), termcrit);
+            cornerSubPix( gray, tmp, winSize, Size(-1,-1), termcrit);
             points[1].push_back(tmp[0]);
             addRemovePt = false;
         }
@@ -134,17 +135,16 @@ int main( int argc, char** argv )
             needToInit = true;
             break;
         case 'c':
+            points[0].clear();
             points[1].clear();
             break;
         case 'n':
             nightMode = !nightMode;
             break;
-        default:
-            ;
         }
 
         std::swap(points[1], points[0]);
-        swap(prevGray, gray);
+        cv::swap(prevGray, gray);
     }
 
     return 0;

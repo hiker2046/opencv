@@ -2,15 +2,14 @@
 #include <iostream>
 #include <string>
 
-#include "opencv2/core/core.hpp"
-#include "opencv2/imgproc/imgproc.hpp"
-#include "opencv2/gpu/gpu.hpp"
-#include "opencv2/highgui/highgui.hpp"
-#include "opencv2/contrib/contrib.hpp"
+#include "opencv2/core.hpp"
+#include "opencv2/core/utility.hpp"
+#include "opencv2/imgproc.hpp"
+#include "opencv2/cudaimgproc.hpp"
+#include "opencv2/highgui.hpp"
 
 using namespace std;
 using namespace cv;
-using namespace cv::gpu;
 
 static Mat loadImage(const string& name)
 {
@@ -26,16 +25,15 @@ static Mat loadImage(const string& name)
 int main(int argc, const char* argv[])
 {
     CommandLineParser cmd(argc, argv,
-        "{ image i        | pic1.png  | input image }"
+        "{ image i        | ../data/pic1.png  | input image }"
         "{ template t     | templ.png | template image }"
-        "{ scale s        |           | estimate scale }"
-        "{ rotation r     |           | estimate rotation }"
+        "{ full           |           | estimate scale and rotation }"
         "{ gpu            |           | use gpu version }"
         "{ minDist        | 100       | minimum distance between the centers of the detected objects }"
         "{ levels         | 360       | R-Table levels }"
         "{ votesThreshold | 30        | the accumulator threshold for the template centers at the detection stage. The smaller it is, the more false positions may be detected }"
-        "{ angleThresh    | 10000     | angle votes treshold }"
-        "{ scaleThresh    | 1000      | scale votes treshold }"
+        "{ angleThresh    | 10000     | angle votes threshold }"
+        "{ scaleThresh    | 1000      | scale votes threshold }"
         "{ posThresh      | 100       | position votes threshold }"
         "{ dp             | 2         | inverse ratio of the accumulator resolution to the image resolution }"
         "{ minScale       | 0.5       | minimal scale to detect }"
@@ -44,11 +42,11 @@ int main(int argc, const char* argv[])
         "{ minAngle       | 0         | minimal rotation angle to detect in degrees }"
         "{ maxAngle       | 360       | maximal rotation angle to detect in degrees }"
         "{ angleStep      | 1         | angle step in degrees }"
-        "{ maxSize        | 1000      | maximal size of inner buffers }"
+        "{ maxBufSize     | 1000      | maximal size of inner buffers }"
         "{ help h ?       |           | print help message }"
     );
 
-    cmd.about("This program demonstrates arbitary object finding with the Generalized Hough transform.");
+    cmd.about("This program demonstrates arbitrary object finding with the Generalized Hough transform.");
 
     if (cmd.has("help"))
     {
@@ -58,8 +56,7 @@ int main(int argc, const char* argv[])
 
     const string templName = cmd.get<string>("template");
     const string imageName = cmd.get<string>("image");
-    const bool estimateScale = cmd.has("scale");
-    const bool estimateRotation = cmd.has("rotation");
+    const bool full = cmd.has("full");
     const bool useGpu = cmd.has("gpu");
     const double minDist = cmd.get<double>("minDist");
     const int levels = cmd.get<int>("levels");
@@ -74,7 +71,7 @@ int main(int argc, const char* argv[])
     const double minAngle = cmd.get<double>("minAngle");
     const double maxAngle = cmd.get<double>("maxAngle");
     const double angleStep = cmd.get<double>("angleStep");
-    const int maxSize = cmd.get<int>("maxSize");
+    const int maxBufSize = cmd.get<int>("maxBufSize");
 
     if (!cmd.check())
     {
@@ -85,93 +82,69 @@ int main(int argc, const char* argv[])
     Mat templ = loadImage(templName);
     Mat image = loadImage(imageName);
 
-    int method = GHT_POSITION;
-    if (estimateScale)
-        method += GHT_SCALE;
-    if (estimateRotation)
-        method += GHT_ROTATION;
+    Ptr<GeneralizedHough> alg;
+
+    if (!full)
+    {
+        Ptr<GeneralizedHoughBallard> ballard = useGpu ? cuda::createGeneralizedHoughBallard() : createGeneralizedHoughBallard();
+
+        ballard->setMinDist(minDist);
+        ballard->setLevels(levels);
+        ballard->setDp(dp);
+        ballard->setMaxBufferSize(maxBufSize);
+        ballard->setVotesThreshold(votesThreshold);
+
+        alg = ballard;
+    }
+    else
+    {
+        Ptr<GeneralizedHoughGuil> guil = useGpu ? cuda::createGeneralizedHoughGuil() : createGeneralizedHoughGuil();
+
+        guil->setMinDist(minDist);
+        guil->setLevels(levels);
+        guil->setDp(dp);
+        guil->setMaxBufferSize(maxBufSize);
+
+        guil->setMinAngle(minAngle);
+        guil->setMaxAngle(maxAngle);
+        guil->setAngleStep(angleStep);
+        guil->setAngleThresh(angleThresh);
+
+        guil->setMinScale(minScale);
+        guil->setMaxScale(maxScale);
+        guil->setScaleStep(scaleStep);
+        guil->setScaleThresh(scaleThresh);
+
+        guil->setPosThresh(posThresh);
+
+        alg = guil;
+    }
 
     vector<Vec4f> position;
-    cv::TickMeter tm;
+    TickMeter tm;
 
     if (useGpu)
     {
-        GpuMat d_templ(templ);
-        GpuMat d_image(image);
-        GpuMat d_position;
+        cuda::GpuMat d_templ(templ);
+        cuda::GpuMat d_image(image);
+        cuda::GpuMat d_position;
 
-        Ptr<GeneralizedHough_GPU> d_hough = GeneralizedHough_GPU::create(method);
-        d_hough->set("minDist", minDist);
-        d_hough->set("levels", levels);
-        d_hough->set("dp", dp);
-        d_hough->set("maxSize", maxSize);
-        if (estimateScale && estimateRotation)
-        {
-            d_hough->set("angleThresh", angleThresh);
-            d_hough->set("scaleThresh", scaleThresh);
-            d_hough->set("posThresh", posThresh);
-        }
-        else
-        {
-            d_hough->set("votesThreshold", votesThreshold);
-        }
-        if (estimateScale)
-        {
-            d_hough->set("minScale", minScale);
-            d_hough->set("maxScale", maxScale);
-            d_hough->set("scaleStep", scaleStep);
-        }
-        if (estimateRotation)
-        {
-            d_hough->set("minAngle", minAngle);
-            d_hough->set("maxAngle", maxAngle);
-            d_hough->set("angleStep", angleStep);
-        }
-
-        d_hough->setTemplate(d_templ);
+        alg->setTemplate(d_templ);
 
         tm.start();
 
-        d_hough->detect(d_image, d_position);
-        d_hough->download(d_position, position);
+        alg->detect(d_image, d_position);
+        d_position.download(position);
 
         tm.stop();
     }
     else
     {
-        Ptr<GeneralizedHough> hough = GeneralizedHough::create(method);
-        hough->set("minDist", minDist);
-        hough->set("levels", levels);
-        hough->set("dp", dp);
-        if (estimateScale && estimateRotation)
-        {
-            hough->set("angleThresh", angleThresh);
-            hough->set("scaleThresh", scaleThresh);
-            hough->set("posThresh", posThresh);
-            hough->set("maxSize", maxSize);
-        }
-        else
-        {
-            hough->set("votesThreshold", votesThreshold);
-        }
-        if (estimateScale)
-        {
-            hough->set("minScale", minScale);
-            hough->set("maxScale", maxScale);
-            hough->set("scaleStep", scaleStep);
-        }
-        if (estimateRotation)
-        {
-            hough->set("minAngle", minAngle);
-            hough->set("maxAngle", maxAngle);
-            hough->set("angleStep", angleStep);
-        }
-
-        hough->setTemplate(templ);
+        alg->setTemplate(templ);
 
         tm.start();
 
-        hough->detect(image, position);
+        alg->detect(image, position);
 
         tm.stop();
     }
@@ -180,7 +153,7 @@ int main(int argc, const char* argv[])
     cout << "Detection time : " << tm.getTimeMilli() << " ms" << endl;
 
     Mat out;
-    cvtColor(image, out, COLOR_GRAY2BGR);
+    cv::cvtColor(image, out, COLOR_GRAY2BGR);
 
     for (size_t i = 0; i < position.size(); ++i)
     {

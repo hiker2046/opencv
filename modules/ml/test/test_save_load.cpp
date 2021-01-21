@@ -1,136 +1,107 @@
-/*M///////////////////////////////////////////////////////////////////////////////////////
-//
-//  IMPORTANT: READ BEFORE DOWNLOADING, COPYING, INSTALLING OR USING.
-//
-//  By downloading, copying, installing or using the software you agree to this license.
-//  If you do not agree to this license, do not download, install,
-//  copy or use the software.
-//
-//
-//                        Intel License Agreement
-//                For Open Source Computer Vision Library
-//
-// Copyright (C) 2000, Intel Corporation, all rights reserved.
-// Third party copyrights are property of their respective owners.
-//
-// Redistribution and use in source and binary forms, with or without modification,
-// are permitted provided that the following conditions are met:
-//
-//   * Redistribution's of source code must retain the above copyright notice,
-//     this list of conditions and the following disclaimer.
-//
-//   * Redistribution's in binary form must reproduce the above copyright notice,
-//     this list of conditions and the following disclaimer in the documentation
-//     and/or other materials provided with the distribution.
-//
-//   * The name of Intel Corporation may not be used to endorse or promote products
-//     derived from this software without specific prior written permission.
-//
-// This software is provided by the copyright holders and contributors "as is" and
-// any express or implied warranties, including, but not limited to, the implied
-// warranties of merchantability and fitness for a particular purpose are disclaimed.
-// In no event shall the Intel Corporation or contributors be liable for any direct,
-// indirect, incidental, special, exemplary, or consequential damages
-// (including, but not limited to, procurement of substitute goods or services;
-// loss of use, data, or profits; or business interruption) however caused
-// and on any theory of liability, whether in contract, strict liability,
-// or tort (including negligence or otherwise) arising in any way out of
-// the use of this software, even if advised of the possibility of such damage.
-//
-//M*/
+// This file is part of OpenCV project.
+// It is subject to the license terms in the LICENSE file found in the top-level directory
+// of this distribution and at http://opencv.org/license.html.
 
 #include "test_precomp.hpp"
 
-#include <iostream>
-#include <fstream>
+namespace opencv_test { namespace {
 
-using namespace cv;
-using namespace std;
 
-CV_SLMLTest::CV_SLMLTest( const char* _modelName ) : CV_MLBaseTest( _modelName )
+void randomFillCategories(const string & filename, Mat & input)
 {
-    validationFN = "slvalidation.xml";
-}
+    Mat catMap;
+    Mat catCount;
+    std::vector<uchar> varTypes;
 
-int CV_SLMLTest::run_test_case( int testCaseIdx )
-{
-    int code = cvtest::TS::OK;
-    code = prepare_test_case( testCaseIdx );
+    FileStorage fs(filename, FileStorage::READ);
+    FileNode root = fs.getFirstTopLevelNode();
+    root["cat_map"] >> catMap;
+    root["cat_count"] >> catCount;
+    root["var_type"] >> varTypes;
 
-    if( code == cvtest::TS::OK )
+    int offset = 0;
+    int countOffset = 0;
+    uint var = 0, varCount = (uint)varTypes.size();
+    for (; var < varCount; ++var)
     {
-            data.mix_train_and_test_idx();
-            code = train( testCaseIdx );
-            if( code == cvtest::TS::OK )
+        if (varTypes[var] == ml::VAR_CATEGORICAL)
+        {
+            int size = catCount.at<int>(0, countOffset);
+            for (int row = 0; row < input.rows; ++row)
             {
-                get_error( testCaseIdx, CV_TEST_ERROR, &test_resps1 );
-                fname1 = tempfile();
-                save( fname1.c_str() );
-                load( fname1.c_str() );
-                get_error( testCaseIdx, CV_TEST_ERROR, &test_resps2 );
-                fname2 = tempfile();
-                save( fname2.c_str() );
+                int randomChosenIndex = offset + ((uint)cv::theRNG()) % size;
+                int value = catMap.at<int>(0, randomChosenIndex);
+                input.at<float>(row, var) = (float)value;
             }
-            else
-                ts->printf( cvtest::TS::LOG, "model can not be trained" );
+            offset += size;
+            ++countOffset;
+        }
     }
-    return code;
 }
 
-int CV_SLMLTest::validate_test_results( int testCaseIdx )
+//==================================================================================================
+
+typedef tuple<string, string> ML_Legacy_Param;
+typedef testing::TestWithParam< ML_Legacy_Param > ML_Legacy_Params;
+
+TEST_P(ML_Legacy_Params, legacy_load)
 {
-    int code = cvtest::TS::OK;
+    const string modelName = get<0>(GetParam());
+    const string dataName = get<1>(GetParam());
+    const string filename = findDataFile("legacy/" + modelName + "_" + dataName + ".xml");
+    const bool isTree = modelName == CV_BOOST || modelName == CV_DTREE || modelName == CV_RTREES;
 
-    // 1. compare files
-    ifstream f1( fname1.c_str() ), f2( fname2.c_str() );
-    string s1, s2;
-    int lineIdx = 0;
-    CV_Assert( f1.is_open() && f2.is_open() );
-    for( ; !f1.eof() && !f2.eof(); lineIdx++ )
-    {
-        getline( f1, s1 );
-        getline( f2, s2 );
-        if( s1.compare(s2) )
-        {
-            ts->printf( cvtest::TS::LOG, "first and second saved files differ in %n-line; first %n line: %s; second %n-line: %s",
-               lineIdx, lineIdx, s1.c_str(), lineIdx, s2.c_str() );
-            code = cvtest::TS::FAIL_INVALID_OUTPUT;
-        }
-    }
-    if( !f1.eof() || !f2.eof() )
-    {
-        ts->printf( cvtest::TS::LOG, "in test case %d first and second saved files differ in %n-line; first %n line: %s; second %n-line: %s",
-            testCaseIdx, lineIdx, lineIdx, s1.c_str(), lineIdx, s2.c_str() );
-        code = cvtest::TS::FAIL_INVALID_OUTPUT;
-    }
-    f1.close();
-    f2.close();
-    // delete temporary files
-    remove( fname1.c_str() );
-    remove( fname2.c_str() );
+    Ptr<StatModel> model;
+    if (modelName == CV_BOOST)
+        model = Algorithm::load<Boost>(filename);
+    else if (modelName == CV_ANN)
+        model = Algorithm::load<ANN_MLP>(filename);
+    else if (modelName == CV_DTREE)
+        model = Algorithm::load<DTrees>(filename);
+    else if (modelName == CV_NBAYES)
+        model = Algorithm::load<NormalBayesClassifier>(filename);
+    else if (modelName == CV_SVM)
+        model = Algorithm::load<SVM>(filename);
+    else if (modelName == CV_RTREES)
+        model = Algorithm::load<RTrees>(filename);
+    else if (modelName == CV_SVMSGD)
+        model = Algorithm::load<SVMSGD>(filename);
+    ASSERT_TRUE(model);
 
-    // 2. compare responses
-    CV_Assert( test_resps1.size() == test_resps2.size() );
-    vector<float>::const_iterator it1 = test_resps1.begin(), it2 = test_resps2.begin();
-    for( ; it1 != test_resps1.end(); ++it1, ++it2 )
-    {
-        if( fabs(*it1 - *it2) > FLT_EPSILON )
-        {
-            ts->printf( cvtest::TS::LOG, "in test case %d responses predicted before saving and after loading is different", testCaseIdx );
-            code = cvtest::TS::FAIL_INVALID_OUTPUT;
-        }
-    }
-    return code;
+    Mat input = Mat(isTree ? 10 : 1, model->getVarCount(), CV_32F);
+    cv::theRNG().fill(input, RNG::UNIFORM, 0, 40);
+
+    if (isTree)
+        randomFillCategories(filename, input);
+
+    Mat output;
+    EXPECT_NO_THROW(model->predict(input, output, StatModel::RAW_OUTPUT | (isTree ? DTrees::PREDICT_SUM : 0)));
+    // just check if no internal assertions or errors thrown
 }
 
-TEST(ML_NaiveBayes, save_load) { CV_SLMLTest test( CV_NBAYES ); test.safe_run(); }
-//CV_SLMLTest lsmlknearest( CV_KNEAREST, "slknearest" ); // does not support save!
-TEST(ML_SVM, save_load) { CV_SLMLTest test( CV_SVM ); test.safe_run(); }
-//CV_SLMLTest lsmlem( CV_EM, "slem" ); // does not support save!
-TEST(ML_ANN, save_load) { CV_SLMLTest test( CV_ANN ); test.safe_run(); }
-TEST(ML_DTree, save_load) { CV_SLMLTest test( CV_DTREE ); test.safe_run(); }
-TEST(ML_Boost, save_load) { CV_SLMLTest test( CV_BOOST ); test.safe_run(); }
-TEST(ML_RTrees, save_load) { CV_SLMLTest test( CV_RTREES ); test.safe_run(); }
-TEST(ML_ERTrees, save_load) { CV_SLMLTest test( CV_ERTREES ); test.safe_run(); }
+ML_Legacy_Param param_list[] = {
+    ML_Legacy_Param(CV_ANN, "waveform"),
+    ML_Legacy_Param(CV_BOOST, "adult"),
+    ML_Legacy_Param(CV_BOOST, "1"),
+    ML_Legacy_Param(CV_BOOST, "2"),
+    ML_Legacy_Param(CV_BOOST, "3"),
+    ML_Legacy_Param(CV_DTREE, "abalone"),
+    ML_Legacy_Param(CV_DTREE, "mushroom"),
+    ML_Legacy_Param(CV_NBAYES, "waveform"),
+    ML_Legacy_Param(CV_SVM, "poletelecomm"),
+    ML_Legacy_Param(CV_SVM, "waveform"),
+    ML_Legacy_Param(CV_RTREES, "waveform"),
+    ML_Legacy_Param(CV_SVMSGD, "waveform"),
+};
 
-/* End of file. */
+INSTANTIATE_TEST_CASE_P(/**/, ML_Legacy_Params, testing::ValuesIn(param_list));
+
+/*TEST(ML_SVM, throw_exception_when_save_untrained_model)
+{
+    Ptr<cv::ml::SVM> svm;
+    string filename = tempfile("svm.xml");
+    ASSERT_THROW(svm.save(filename.c_str()), Exception);
+    remove(filename.c_str());
+}*/
+
+}} // namespace

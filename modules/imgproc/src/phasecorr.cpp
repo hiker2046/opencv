@@ -1,3 +1,7 @@
+// This file is a part of OpenCV project.
+// See opencv/LICENSE and http://opencv.org/license.html for the actual licensing terms.
+// See also opencv/doc/LICENSE_CHANGE_NOTICE.txt. Below is the original license:
+
 /*********************************************************************
  * Software License Agreement (BSD License)
  *
@@ -66,8 +70,8 @@ static void magSpectrums( InputArray _src, OutputArray _dst)
 
     if( depth == CV_32F )
     {
-        const float* dataSrc = (const float*)src.data;
-        float* dataDst = (float*)dst.data;
+        const float* dataSrc = src.ptr<float>();
+        float* dataDst = dst.ptr<float>();
 
         size_t stepSrc = src.step/sizeof(dataSrc[0]);
         size_t stepDst = dst.step/sizeof(dataDst[0]);
@@ -110,8 +114,8 @@ static void magSpectrums( InputArray _src, OutputArray _dst)
     }
     else
     {
-        const double* dataSrc = (const double*)src.data;
-        double* dataDst = (double*)dst.data;
+        const double* dataSrc = src.ptr<double>();
+        double* dataDst = dst.ptr<double>();
 
         size_t stepSrc = src.step/sizeof(dataSrc[0]);
         size_t stepDst = dst.step/sizeof(dataDst[0]);
@@ -167,6 +171,9 @@ static void divSpectrums( InputArray _srcA, InputArray _srcB, OutputArray _dst, 
     _dst.create( srcA.rows, srcA.cols, type );
     Mat dst = _dst.getMat();
 
+    CV_Assert(dst.data != srcA.data); // non-inplace check
+    CV_Assert(dst.data != srcB.data); // non-inplace check
+
     bool is_1d = (flags & DFT_ROWS) || (rows == 1 || (cols == 1 &&
              srcA.isContinuous() && srcB.isContinuous() && dst.isContinuous()));
 
@@ -179,9 +186,9 @@ static void divSpectrums( InputArray _srcA, InputArray _srcB, OutputArray _dst, 
 
     if( depth == CV_32F )
     {
-        const float* dataA = (const float*)srcA.data;
-        const float* dataB = (const float*)srcB.data;
-        float* dataC = (float*)dst.data;
+        const float* dataA = srcA.ptr<float>();
+        const float* dataB = srcB.ptr<float>();
+        float* dataC = dst.ptr<float>();
         float eps = FLT_EPSILON; // prevent div0 problems
 
         size_t stepA = srcA.step/sizeof(dataA[0]);
@@ -264,9 +271,9 @@ static void divSpectrums( InputArray _srcA, InputArray _srcB, OutputArray _dst, 
     }
     else
     {
-        const double* dataA = (const double*)srcA.data;
-        const double* dataB = (const double*)srcB.data;
-        double* dataC = (double*)dst.data;
+        const double* dataA = srcA.ptr<double>();
+        const double* dataB = srcB.ptr<double>();
+        double* dataC = dst.ptr<double>();
         double eps = DBL_EPSILON; // prevent div0 problems
 
         size_t stepA = srcA.step/sizeof(dataA[0]);
@@ -359,7 +366,7 @@ static void fftShift(InputOutputArray _out)
         return;
     }
 
-    vector<Mat> planes;
+    std::vector<Mat> planes;
     split(out, planes);
 
     int xMid = out.cols >> 1;
@@ -369,37 +376,57 @@ static void fftShift(InputOutputArray _out)
 
     if(is_1d)
     {
+        int is_odd = (xMid > 0 && out.cols % 2 == 1) || (yMid > 0 && out.rows % 2 == 1);
         xMid = xMid + yMid;
 
         for(size_t i = 0; i < planes.size(); i++)
         {
             Mat tmp;
-            Mat half0(planes[i], Rect(0, 0, xMid, 1));
-            Mat half1(planes[i], Rect(xMid, 0, xMid, 1));
+            Mat half0(planes[i], Rect(0, 0, xMid + is_odd, 1));
+            Mat half1(planes[i], Rect(xMid + is_odd, 0, xMid, 1));
 
             half0.copyTo(tmp);
-            half1.copyTo(half0);
-            tmp.copyTo(half1);
+            half1.copyTo(planes[i](Rect(0, 0, xMid, 1)));
+            tmp.copyTo(planes[i](Rect(xMid, 0, xMid + is_odd, 1)));
         }
     }
     else
     {
+        int isXodd = out.cols % 2 == 1;
+        int isYodd = out.rows % 2 == 1;
         for(size_t i = 0; i < planes.size(); i++)
         {
             // perform quadrant swaps...
-            Mat tmp;
-            Mat q0(planes[i], Rect(0,    0,    xMid, yMid));
-            Mat q1(planes[i], Rect(xMid, 0,    xMid, yMid));
-            Mat q2(planes[i], Rect(0,    yMid, xMid, yMid));
-            Mat q3(planes[i], Rect(xMid, yMid, xMid, yMid));
+            Mat q0(planes[i], Rect(0,    0,    xMid + isXodd, yMid + isYodd));
+            Mat q1(planes[i], Rect(xMid + isXodd, 0,    xMid, yMid + isYodd));
+            Mat q2(planes[i], Rect(0,    yMid + isYodd, xMid + isXodd, yMid));
+            Mat q3(planes[i], Rect(xMid + isXodd, yMid + isYodd, xMid, yMid));
 
-            q0.copyTo(tmp);
-            q3.copyTo(q0);
-            tmp.copyTo(q3);
+            if(!(isXodd || isYodd))
+            {
+                Mat tmp;
+                q0.copyTo(tmp);
+                q3.copyTo(q0);
+                tmp.copyTo(q3);
 
-            q1.copyTo(tmp);
-            q2.copyTo(q1);
-            tmp.copyTo(q2);
+                q1.copyTo(tmp);
+                q2.copyTo(q1);
+                tmp.copyTo(q2);
+            }
+            else
+            {
+                Mat tmp0, tmp1, tmp2 ,tmp3;
+                q0.copyTo(tmp0);
+                q1.copyTo(tmp1);
+                q2.copyTo(tmp2);
+                q3.copyTo(tmp3);
+
+                tmp0.copyTo(planes[i](Rect(xMid, yMid, xMid + isXodd, yMid + isYodd)));
+                tmp3.copyTo(planes[i](Rect(0, 0, xMid, yMid)));
+
+                tmp1.copyTo(planes[i](Rect(0, yMid, xMid, yMid + isYodd)));
+                tmp2.copyTo(planes[i](Rect(xMid, 0, xMid + isXodd, yMid)));
+            }
         }
     }
 
@@ -444,7 +471,7 @@ static Point2d weightedCentroid(InputArray _src, cv::Point peakLocation, cv::Siz
 
     if(type == CV_32FC1)
     {
-        const float* dataIn = (const float*)src.data;
+        const float* dataIn = src.ptr<float>();
         dataIn += minr*src.cols;
         for(int y = minr; y <= maxr; y++)
         {
@@ -460,7 +487,7 @@ static Point2d weightedCentroid(InputArray _src, cv::Point peakLocation, cv::Siz
     }
     else
     {
-        const double* dataIn = (const double*)src.data;
+        const double* dataIn = src.ptr<double>();
         dataIn += minr*src.cols;
         for(int y = minr; y <= maxr; y++)
         {
@@ -490,6 +517,8 @@ static Point2d weightedCentroid(InputArray _src, cv::Point peakLocation, cv::Siz
 
 cv::Point2d cv::phaseCorrelate(InputArray _src1, InputArray _src2, InputArray _window, double* response)
 {
+    CV_INSTRUMENT_REGION();
+
     Mat src1 = _src1.getMat();
     Mat src2 = _src2.getMat();
     Mat window = _window.getMat();
@@ -571,25 +600,31 @@ cv::Point2d cv::phaseCorrelate(InputArray _src1, InputArray _src2, InputArray _w
 
 void cv::createHanningWindow(OutputArray _dst, cv::Size winSize, int type)
 {
+    CV_INSTRUMENT_REGION();
+
     CV_Assert( type == CV_32FC1 || type == CV_64FC1 );
+    CV_Assert( winSize.width > 1 && winSize.height > 1 );
 
     _dst.create(winSize, type);
     Mat dst = _dst.getMat();
 
-    int rows = dst.rows;
-    int cols = dst.cols;
+    int rows = dst.rows, cols = dst.cols;
+
+    AutoBuffer<double> _wc(cols);
+    double* const wc = _wc.data();
+
+    double coeff0 = 2.0 * CV_PI / (double)(cols - 1), coeff1 = 2.0f * CV_PI / (double)(rows - 1);
+    for(int j = 0; j < cols; j++)
+        wc[j] = 0.5 * (1.0 - cos(coeff0 * j));
 
     if(dst.depth() == CV_32F)
     {
         for(int i = 0; i < rows; i++)
         {
             float* dstData = dst.ptr<float>(i);
-            double wr = 0.5 * (1.0f - cos(2.0f * CV_PI * (double)i / (double)(rows - 1)));
+            double wr = 0.5 * (1.0 - cos(coeff1 * i));
             for(int j = 0; j < cols; j++)
-            {
-                double wc = 0.5 * (1.0f - cos(2.0f * CV_PI * (double)j / (double)(cols - 1)));
-                dstData[j] = (float)(wr * wc);
-            }
+                dstData[j] = (float)(wr * wc[j]);
         }
     }
     else
@@ -597,12 +632,9 @@ void cv::createHanningWindow(OutputArray _dst, cv::Size winSize, int type)
         for(int i = 0; i < rows; i++)
         {
             double* dstData = dst.ptr<double>(i);
-            double wr = 0.5 * (1.0 - cos(2.0 * CV_PI * (double)i / (double)(rows - 1)));
+            double wr = 0.5 * (1.0 - cos(coeff1 * i));
             for(int j = 0; j < cols; j++)
-            {
-                double wc = 0.5 * (1.0 - cos(2.0 * CV_PI * (double)j / (double)(cols - 1)));
-                dstData[j] = wr * wc;
-            }
+                dstData[j] = wr * wc[j];
         }
     }
 

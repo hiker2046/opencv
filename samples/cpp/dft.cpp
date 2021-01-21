@@ -1,35 +1,40 @@
-#include "opencv2/core/core.hpp"
-#include "opencv2/imgproc/imgproc.hpp"
-#include "opencv2/highgui/highgui.hpp"
+#include "opencv2/core.hpp"
+#include "opencv2/core/utility.hpp"
+#include "opencv2/imgproc.hpp"
+#include "opencv2/imgcodecs.hpp"
+#include "opencv2/highgui.hpp"
 
 #include <stdio.h>
 
 using namespace cv;
 using namespace std;
 
-static void help()
+static void help(const char ** argv)
 {
     printf("\nThis program demonstrated the use of the discrete Fourier transform (dft)\n"
            "The dft of an image is taken and it's power spectrum is displayed.\n"
-           "Usage:\n"
-            "./dft [image_name -- default lena.jpg]\n");
+           "Usage:\n %s [image_name -- default lena.jpg]\n",argv[0]);
 }
 
 const char* keys =
 {
-    "{@image|lena.jpg|input image file}"
+    "{help h||}{@image|lena.jpg|input image file}"
 };
 
 int main(int argc, const char ** argv)
 {
-    help();
+    help(argv);
     CommandLineParser parser(argc, argv, keys);
-    string filename = parser.get<string>(1);
-
-    Mat img = imread(filename.c_str(), CV_LOAD_IMAGE_GRAYSCALE);
+    if (parser.has("help"))
+    {
+        help(argv);
+        return 0;
+    }
+    string filename = parser.get<string>(0);
+    Mat img = imread(samples::findFile(filename), IMREAD_GRAYSCALE);
     if( img.empty() )
     {
-        help();
+        help(argv);
         printf("Cannot read image file: %s\n", filename.c_str());
         return -1;
     }
@@ -73,10 +78,9 @@ int main(int argc, const char ** argv)
     q2.copyTo(q1);
     tmp.copyTo(q2);
 
-    normalize(mag, mag, 0, 1, CV_MINMAX);
+    normalize(mag, mag, 0, 1, NORM_MINMAX);
 
     imshow("spectrum magnitude", mag);
     waitKey();
     return 0;
 }
-

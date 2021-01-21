@@ -1,12 +1,14 @@
 /**
- * @file LinearTransforms.cpp
+ * @file BasicLinearTransformsTrackbar.cpp
  * @brief Simple program to change contrast and brightness
  * @date Mon, June 6, 2011
  * @author OpenCV team
  */
 
-#include "opencv2/highgui/highgui.hpp"
+#include "opencv2/imgcodecs.hpp"
+#include "opencv2/highgui.hpp"
 
+// we're NOT "using namespace std;" here, to avoid collisions between the beta variable and std::beta in c++17
 using namespace cv;
 
 /** Global Variables */
@@ -24,17 +26,14 @@ Mat image;
  */
 static void on_trackbar( int, void* )
 {
-   Mat new_image = Mat::zeros( image.size(), image.type() );
+    Mat new_image = Mat::zeros( image.size(), image.type() );
 
-   for( int y = 0; y < image.rows; y++ )
-      { for( int x = 0; x < image.cols; x++ )
-           { for( int c = 0; c < 3; c++ )
-                {
-          new_image.at<Vec3b>(y,x)[c] = saturate_cast<uchar>( alpha*( image.at<Vec3b>(y,x)[c] ) + beta );
-                }
-       }
-      }
-   imshow("New Image", new_image);
+    for( int y = 0; y < image.rows; y++ )
+        for( int x = 0; x < image.cols; x++ )
+            for( int c = 0; c < 3; c++ )
+                new_image.at<Vec3b>(y,x)[c] = saturate_cast<uchar>( alpha*( image.at<Vec3b>(y,x)[c] ) + beta );
+
+    imshow("New Image", new_image);
 }
 
 
@@ -42,10 +41,15 @@ static void on_trackbar( int, void* )
  * @function main
  * @brief Main function
  */
-int main( int, char** argv )
+int main( int argc, char** argv )
 {
    /// Read image given by user
-   image = imread( argv[1] );
+   String imageName("lena.jpg"); // by default
+   if (argc > 1)
+   {
+      imageName = argv[1];
+   }
+   image = imread( samples::findFile( imageName ) );
 
    /// Initialize values
    alpha = 1;
@@ -56,8 +60,8 @@ int main( int, char** argv )
    namedWindow("New Image", 1);
 
    /// Create Trackbars
-   createTrackbar( "Contrast Trackbar", "New Image", &alpha, alpha_max, on_trackbar );
-   createTrackbar( "Brightness Trackbar", "New Image", &beta, beta_max, on_trackbar );
+   createTrackbar( "Contrast", "New Image", &alpha, alpha_max, on_trackbar );
+   createTrackbar( "Brightness", "New Image", &beta, beta_max, on_trackbar );
 
    /// Show some stuff
    imshow("Original Image", image);

@@ -1,5 +1,7 @@
-#include "opencv2/imgproc/imgproc.hpp"
-#include "opencv2/highgui/highgui.hpp"
+#include <opencv2/core/utility.hpp>
+#include "opencv2/imgproc.hpp"
+#include "opencv2/imgcodecs.hpp"
+#include "opencv2/highgui.hpp"
 
 #include <cstdio>
 #include <iostream>
@@ -7,11 +9,10 @@
 using namespace cv;
 using namespace std;
 
-static void help()
+static void help(char** argv)
 {
     cout << "\nThis program demonstrates the famous watershed segmentation algorithm in OpenCV: watershed()\n"
-            "Usage:\n"
-            "./watershed [image_name -- default is fruits.jpg]\n" << endl;
+            "Usage:\n" << argv[0] <<" [image_name -- default is fruits.jpg]\n" << endl;
 
 
     cout << "Hot keys: \n"
@@ -28,11 +29,11 @@ static void onMouse( int event, int x, int y, int flags, void* )
 {
     if( x < 0 || x >= img.cols || y < 0 || y >= img.rows )
         return;
-    if( event == CV_EVENT_LBUTTONUP || !(flags & CV_EVENT_FLAG_LBUTTON) )
+    if( event == EVENT_LBUTTONUP || !(flags & EVENT_FLAG_LBUTTON) )
         prevPt = Point(-1,-1);
-    else if( event == CV_EVENT_LBUTTONDOWN )
+    else if( event == EVENT_LBUTTONDOWN )
         prevPt = Point(x,y);
-    else if( event == CV_EVENT_MOUSEMOVE && (flags & CV_EVENT_FLAG_LBUTTON) )
+    else if( event == EVENT_MOUSEMOVE && (flags & EVENT_FLAG_LBUTTON) )
     {
         Point pt(x, y);
         if( prevPt.x < 0 )
@@ -46,45 +47,52 @@ static void onMouse( int event, int x, int y, int flags, void* )
 
 int main( int argc, char** argv )
 {
-    char* filename = argc >= 2 ? argv[1] : (char*)"fruits.jpg";
+    cv::CommandLineParser parser(argc, argv, "{help h | | }{ @input | fruits.jpg | }");
+    if (parser.has("help"))
+    {
+        help(argv);
+        return 0;
+    }
+    string filename = samples::findFile(parser.get<string>("@input"));
     Mat img0 = imread(filename, 1), imgGray;
 
     if( img0.empty() )
     {
-        cout << "Couldn'g open image " << filename << ". Usage: watershed <image_name>\n";
+        cout << "Couldn't open image ";
+        help(argv);
         return 0;
     }
-    help();
+    help(argv);
     namedWindow( "image", 1 );
 
     img0.copyTo(img);
-    cvtColor(img, markerMask, CV_BGR2GRAY);
-    cvtColor(markerMask, imgGray, CV_GRAY2BGR);
+    cvtColor(img, markerMask, COLOR_BGR2GRAY);
+    cvtColor(markerMask, imgGray, COLOR_GRAY2BGR);
     markerMask = Scalar::all(0);
     imshow( "image", img );
     setMouseCallback( "image", onMouse, 0 );
 
     for(;;)
     {
-        int c = waitKey(0);
+        char c = (char)waitKey(0);
 
-        if( (char)c == 27 )
+        if( c == 27 )
             break;
 
-        if( (char)c == 'r' )
+        if( c == 'r' )
         {
             markerMask = Scalar::all(0);
             img0.copyTo(img);
             imshow( "image", img );
         }
 
-        if( (char)c == 'w' || (char)c == ' ' )
+        if( c == 'w' || c == ' ' )
         {
             int i, j, compCount = 0;
             vector<vector<Point> > contours;
             vector<Vec4i> hierarchy;
 
-            findContours(markerMask, contours, hierarchy, CV_RETR_CCOMP, CV_CHAIN_APPROX_SIMPLE);
+            findContours(markerMask, contours, hierarchy, RETR_CCOMP, CHAIN_APPROX_SIMPLE);
 
             if( contours.empty() )
                 continue;

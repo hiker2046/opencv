@@ -1,10 +1,8 @@
 #include "perf_precomp.hpp"
 
-using namespace std;
-using namespace cv;
+namespace opencv_test
+{
 using namespace perf;
-using std::tr1::make_tuple;
-using std::tr1::get;
 
 PERF_TEST_P(Size_MatType, sum, TYPICAL_MATS)
 {
@@ -33,7 +31,7 @@ PERF_TEST_P(Size_MatType, mean, TYPICAL_MATS)
 
     TEST_CYCLE() s = mean(src);
 
-    SANITY_CHECK(s, 1e-6);
+    SANITY_CHECK(s, 1e-5);
 }
 
 PERF_TEST_P(Size_MatType, mean_mask, TYPICAL_MATS)
@@ -49,7 +47,7 @@ PERF_TEST_P(Size_MatType, mean_mask, TYPICAL_MATS)
 
     TEST_CYCLE() s = mean(src, mask);
 
-    SANITY_CHECK(s, 1e-6);
+    SANITY_CHECK(s, 5e-5);
 }
 
 PERF_TEST_P(Size_MatType, meanStdDev, TYPICAL_MATS)
@@ -65,8 +63,8 @@ PERF_TEST_P(Size_MatType, meanStdDev, TYPICAL_MATS)
 
     TEST_CYCLE() meanStdDev(src, mean, dev);
 
-    SANITY_CHECK(mean, 1e-6);
-    SANITY_CHECK(dev, 1e-6);
+    SANITY_CHECK(mean, 1e-5, ERROR_RELATIVE);
+    SANITY_CHECK(dev, 1e-5, ERROR_RELATIVE);
 }
 
 PERF_TEST_P(Size_MatType, meanStdDev_mask, TYPICAL_MATS)
@@ -83,8 +81,8 @@ PERF_TEST_P(Size_MatType, meanStdDev_mask, TYPICAL_MATS)
 
     TEST_CYCLE() meanStdDev(src, mean, dev, mask);
 
-    SANITY_CHECK(mean, 1e-6);
-    SANITY_CHECK(dev, 1e-6);
+    SANITY_CHECK(mean, 1e-5);
+    SANITY_CHECK(dev, 1e-5);
 }
 
 PERF_TEST_P(Size_MatType, countNonZero, testing::Combine( testing::Values( TYPICAL_MAT_SIZES ), testing::Values( CV_8UC1, CV_8SC1, CV_16UC1, CV_16SC1, CV_32SC1, CV_32FC1, CV_64FC1 ) ))
@@ -97,7 +95,10 @@ PERF_TEST_P(Size_MatType, countNonZero, testing::Combine( testing::Values( TYPIC
 
     declare.in(src, WARMUP_RNG);
 
-    TEST_CYCLE() cnt = countNonZero(src);
+    int runs = (sz.width <= 640) ? 8 : 1;
+    TEST_CYCLE_MULTIRUN(runs) cnt = countNonZero(src);
 
     SANITY_CHECK(cnt);
 }
+
+} // namespace

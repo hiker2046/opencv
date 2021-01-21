@@ -1,7 +1,9 @@
+// This file is part of OpenCV project.
+// It is subject to the license terms in the LICENSE file found in the top-level directory
+// of this distribution and at http://opencv.org/license.html.
 #include "test_precomp.hpp"
 
-using namespace cv;
-using namespace std;
+namespace opencv_test { namespace {
 
 class Core_RandTest : public cvtest::BaseTest
 {
@@ -37,8 +39,8 @@ bool Core_RandTest::check_pdf(const Mat& hist, double scale,
                             int dist_type, double& refval, double& realval)
 {
     Mat hist0(hist.size(), CV_32F);
-    const int* H = (const int*)hist.data;
-    float* H0 = ((float*)hist0.data);
+    const int* H = hist.ptr<int>();
+    float* H0 = hist0.ptr<float>();
     int i, hsz = hist.cols;
 
     double sum = 0;
@@ -166,15 +168,15 @@ void Core_RandTest::run( int )
         {
             tested_rng = saved_rng;
             int sz = 0, dsz = 0, slice;
-            for( slice = 0; slice < maxSlice; slice++, sz += dsz )
+            for( slice = 0; slice < maxSlice && sz < SZ; slice++, sz += dsz )
             {
-                dsz = slice+1 < maxSlice ? (int)(cvtest::randInt(rng) % (SZ - sz + 1)) : SZ - sz;
+                dsz = slice+1 < maxSlice ? (int)(cvtest::randInt(rng) % (SZ - sz) + 1) : SZ - sz;
                 Mat aslice = arr[k].colRange(sz, sz + dsz);
                 tested_rng.fill(aslice, dist_type, A, B);
             }
         }
 
-        if( maxk >= 1 && norm(arr[0], arr[1], NORM_INF) > eps)
+        if( maxk >= 1 && cvtest::norm(arr[0], arr[1], NORM_INF) > eps)
         {
             ts->printf( cvtest::TS::LOG, "RNG output depends on the array lengths (some generated numbers get lost?)" );
             ts->set_failed_test_info( cvtest::TS::FAIL_INVALID_OUTPUT );
@@ -183,7 +185,7 @@ void Core_RandTest::run( int )
 
         for( c = 0; c < cn; c++ )
         {
-            const uchar* data = arr[0].data;
+            const uchar* data = arr[0].ptr();
             int* H = hist[c].ptr<int>();
             int HSZ = hist[c].cols;
             double minVal = dist_type == CV_RAND_UNI ? A[c] : A[c] - B[c]*4;
@@ -255,7 +257,7 @@ void Core_RandTest::run( int )
             int SDIM = cvtest::randInt(rng) % (MAX_SDIM-1) + 2;
             int N0 = (SZ*cn/SDIM), n = 0;
             double r2 = 0;
-            const uchar* data = arr[0].data;
+            const uchar* data = arr[0].ptr();
             double scale[4], delta[4];
             for( c = 0; c < cn; c++ )
             {
@@ -339,3 +341,83 @@ protected:
 
 TEST(Core_Rand, range) { Core_RandRangeTest test; test.safe_run(); }
 
+
+TEST(Core_RNG_MT19937, regression)
+{
+    cv::RNG_MT19937 rng;
+    int actual[61] = {0, };
+    const size_t length = (sizeof(actual) / sizeof(actual[0]));
+    for (int i = 0; i < 10000; ++i )
+    {
+        actual[(unsigned)(rng.next() ^ i) % length]++;
+    }
+
+    int expected[length] = {
+        177, 158, 180, 177,  160, 179, 143, 162,
+        177, 144, 170, 174,  165, 168, 168, 156,
+        177, 157, 159, 169,  177, 182, 166, 154,
+        144, 180, 168, 152,  170, 187, 160, 145,
+        139, 164, 157, 179,  148, 183, 159, 160,
+        196, 184, 149, 142,  162, 148, 163, 152,
+        168, 173, 160, 181,  172, 181, 155, 153,
+        158, 171, 138, 150,  150 };
+
+    for (size_t i = 0; i < length; ++i)
+    {
+        ASSERT_EQ(expected[i], actual[i]);
+    }
+}
+
+
+TEST(Core_Rand, Regression_Stack_Corruption)
+{
+    int bufsz = 128; //enough for 14 doubles
+    AutoBuffer<uchar> buffer(bufsz);
+    size_t offset = 0;
+    cv::Mat_<cv::Point2d> x(2, 3, (cv::Point2d*)(buffer.data()+offset));
+    offset += x.total()*x.elemSize();
+    double& param1 = *(double*)(buffer.data()+offset);
+    offset += sizeof(double);
+    double& param2 = *(double*)(buffer.data()+offset);
+    param1 = -9; param2 = 2;
+
+    cv::theRNG().fill(x, cv::RNG::NORMAL, param1, param2);
+
+    ASSERT_EQ(param1, -9);
+    ASSERT_EQ(param2,  2);
+}
+
+
+class RandRowFillParallelLoopBody : public cv::ParallelLoopBody
+{
+public:
+    RandRowFillParallelLoopBody(Mat& dst) : dst_(dst) {}
+    ~RandRowFillParallelLoopBody() {}
+    void operator()(const cv::Range& r) const
+    {
+        cv::RNG rng = cv::theRNG(); // copy state
+        for (int y = r.start; y < r.end; y++)
+        {
+            cv::theRNG() = cv::RNG(rng.state + y); // seed is based on processed row
+            cv::randu(dst_.row(y), Scalar(-100), Scalar(100));
+        }
+        // theRNG() state is changed here (but state collision has low probability, so we don't check this)
+    }
+protected:
+    Mat& dst_;
+};
+
+TEST(Core_Rand, parallel_for_stable_results)
+{
+    cv::RNG rng = cv::theRNG(); // save rng state
+    Mat dst1(1000, 100, CV_8SC1);
+    parallel_for_(cv::Range(0, dst1.rows), RandRowFillParallelLoopBody(dst1));
+
+    cv::theRNG() = rng; // restore rng state
+    Mat dst2(1000, 100, CV_8SC1);
+    parallel_for_(cv::Range(0, dst2.rows), RandRowFillParallelLoopBody(dst2));
+
+    ASSERT_EQ(0, countNonZero(dst1 != dst2));
+}
+
+}} // namespace

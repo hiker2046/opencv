@@ -1,20 +1,18 @@
 #include "perf_precomp.hpp"
 
-using namespace std;
-using namespace cv;
+namespace opencv_test
+{
 using namespace perf;
-using std::tr1::make_tuple;
-using std::tr1::get;
 
 CV_ENUM(NormType, NORM_L1, NORM_L2, NORM_L2SQR, NORM_HAMMING, NORM_HAMMING2)
 
-typedef std::tr1::tuple<NormType, MatType, bool> Norm_Destination_CrossCheck_t;
+typedef tuple<NormType, MatType, bool> Norm_Destination_CrossCheck_t;
 typedef perf::TestBaseWithParam<Norm_Destination_CrossCheck_t> Norm_Destination_CrossCheck;
 
-typedef std::tr1::tuple<NormType, bool> Norm_CrossCheck_t;
+typedef tuple<NormType, bool> Norm_CrossCheck_t;
 typedef perf::TestBaseWithParam<Norm_CrossCheck_t> Norm_CrossCheck;
 
-typedef std::tr1::tuple<MatType, bool> Source_CrossCheck_t;
+typedef tuple<MatType, bool> Source_CrossCheck_t;
 typedef perf::TestBaseWithParam<Source_CrossCheck_t> Source_CrossCheck;
 
 void generateData( Mat& query, Mat& train, const int sourceType );
@@ -144,13 +142,13 @@ void generateData( Mat& query, Mat& train, const int sourceType )
     rng.fill( buf, RNG::UNIFORM, Scalar::all(0), Scalar(3) );
     buf.convertTo( query, sourceType );
 
-    // Generate train decriptors as follows:
+    // Generate train descriptors as follows:
     // copy each query descriptor to train set countFactor times
     // and perturb some one element of the copied descriptors in
     // in ascending order. General boundaries of the perturbation
     // are (0.f, 1.f).
     train.create( query.rows*countFactor, query.cols, sourceType );
-    float step = 1.f / countFactor;
+    float step = (sourceType == CV_8U ? 256.f : 1.f) / countFactor;
     for( int qIdx = 0; qIdx < query.rows; qIdx++ )
     {
         Mat queryDescriptor = query.row(qIdx);
@@ -161,7 +159,9 @@ void generateData( Mat& query, Mat& train, const int sourceType )
             queryDescriptor.copyTo( trainDescriptor );
             int elem = rng(dim);
             float diff = rng.uniform( step*c, step*(c+1) );
-            trainDescriptor.at<float>(0, elem) += diff;
+            trainDescriptor.col(elem) += diff;
         }
     }
 }
+
+} // namespace

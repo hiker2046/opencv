@@ -31,8 +31,11 @@
 #ifndef OPENCV_FLANN_TIMER_H
 #define OPENCV_FLANN_TIMER_H
 
+//! @cond IGNORED
+
 #include <time.h>
-#include "opencv2/core/core.hpp"
+#include "opencv2/core.hpp"
+#include "opencv2/core/utility.hpp"
 
 namespace cvflann
 {
@@ -57,6 +60,7 @@ public:
      * Constructor.
      */
     StartStopTimer()
+        : startTime(0)
     {
         reset();
     }
@@ -89,5 +93,7 @@ public:
 };
 
 }
+
+//! @endcond
 
 #endif // FLANN_TIMER_H

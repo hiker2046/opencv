@@ -41,9 +41,8 @@
 //M*/
 
 #include "test_precomp.hpp"
-#include <string>
 
-using namespace cv;
+namespace opencv_test { namespace {
 
 class CV_InpaintTest : public cvtest::BaseTest
 {
@@ -77,21 +76,21 @@ void CV_InpaintTest::run( int )
     mask.convertTo(inv_mask, CV_8UC3, -1.0, 255.0);
 
     Mat mask1ch;
-    cv::cvtColor(mask, mask1ch, CV_BGR2GRAY);
+    cv::cvtColor(mask, mask1ch, COLOR_BGR2GRAY);
 
     Mat test = orig.clone();
     test.setTo(Scalar::all(255), mask1ch);
 
     Mat res1, res2;
-    inpaint( test, mask1ch, res1, 5, CV_INPAINT_NS );
-    inpaint( test, mask1ch, res2, 5, CV_INPAINT_TELEA );
+    inpaint( test, mask1ch, res1, 5, INPAINT_NS );
+    inpaint( test, mask1ch, res2, 5, INPAINT_TELEA );
 
     Mat diff1, diff2;
     absdiff( orig, res1, diff1 );
     absdiff( orig, res2, diff2 );
 
-    double n1 = norm(diff1.reshape(1), NORM_INF, inv_mask.reshape(1));
-    double n2 = norm(diff2.reshape(1), NORM_INF, inv_mask.reshape(1));
+    double n1 = cvtest::norm(diff1.reshape(1), NORM_INF, inv_mask.reshape(1));
+    double n2 = cvtest::norm(diff2.reshape(1), NORM_INF, inv_mask.reshape(1));
 
     if (n1 != 0 || n2 != 0)
     {
@@ -102,8 +101,8 @@ void CV_InpaintTest::run( int )
     absdiff( exp1, res1, diff1 );
     absdiff( exp2, res2, diff2 );
 
-    n1 = norm(diff1.reshape(1), NORM_INF, mask.reshape(1));
-    n2 = norm(diff2.reshape(1), NORM_INF, mask.reshape(1));
+    n1 = cvtest::norm(diff1.reshape(1), NORM_INF, mask.reshape(1));
+    n2 = cvtest::norm(diff2.reshape(1), NORM_INF, mask.reshape(1));
 
     const int jpeg_thres = 3;
     if (n1 > jpeg_thres || n2 > jpeg_thres)
@@ -115,4 +114,47 @@ void CV_InpaintTest::run( int )
     ts->set_failed_test_info(cvtest::TS::OK);
 }
 
-TEST(Imgproc_Inpaint, regression) { CV_InpaintTest test; test.safe_run(); }
+TEST(Photo_Inpaint, regression) { CV_InpaintTest test; test.safe_run(); }
+
+typedef testing::TestWithParam<tuple<int> > formats;
+
+TEST_P(formats, 1c)
+{
+    const int type = get<0>(GetParam());
+    Mat src(100, 100, type);
+    src.setTo(Scalar::all(128));
+    Mat ref = src.clone();
+    Mat dst, mask = Mat::zeros(src.size(), CV_8U);
+
+    circle(src, Point(50, 50), 5, Scalar(200), 6);
+    circle(mask, Point(50, 50), 5, Scalar(200), 6);
+    inpaint(src, mask, dst, 10, INPAINT_NS);
+
+    Mat dst2;
+    inpaint(src, mask, dst2, 10, INPAINT_TELEA);
+
+    ASSERT_LE(cv::norm(dst, ref, NORM_INF), 3.);
+    ASSERT_LE(cv::norm(dst2, ref, NORM_INF), 3.);
+}
+
+INSTANTIATE_TEST_CASE_P(Photo_Inpaint, formats, testing::Values(CV_32F, CV_16U, CV_8U));
+
+TEST(Photo_InpaintBorders, regression)
+{
+    Mat img(64, 64, CV_8U);
+    img = 128;
+    img(Rect(0, 0, 16, 64)) = 0;
+
+    Mat mask(64, 64, CV_8U);
+    mask = 0;
+    mask(Rect(0, 0, 16, 64)) = 255;
+
+    Mat inpainted;
+    inpaint(img, mask, inpainted, 1, INPAINT_TELEA);
+
+    Mat diff;
+    cv::absdiff(inpainted, 128*Mat::ones(inpainted.size(), inpainted.type()), diff);
+    ASSERT_TRUE(countNonZero(diff) == 0);
+}
+
+}} // namespace

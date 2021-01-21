@@ -1,45 +1,69 @@
-#!/usr/bin/python
-import urllib2
-import cv2.cv as cv
+#!/usr/bin/env python
+
+'''
+    This program demonstrates Laplace point/edge detection using
+    OpenCV function Laplacian()
+    It captures from the camera of your choice: 0, 1, ... default 0
+    Usage:
+        python laplace.py <ddepth> <smoothType> <sigma>
+        If no arguments given default arguments will be used.
+
+    Keyboard Shortcuts:
+    Press space bar to exit the program.
+    '''
+
+# Python 2/3 compatibility
+from __future__ import print_function
+
+import numpy as np
+import cv2 as cv
 import sys
 
-if __name__ == "__main__":
-    laplace = None
-    colorlaplace = None
-    planes = [ None, None, None ]
-    capture = None
-
-    if len(sys.argv) == 1:
-        capture = cv.CreateCameraCapture(0)
-    elif len(sys.argv) == 2 and sys.argv[1].isdigit():
-        capture = cv.CreateCameraCapture(int(sys.argv[1]))
-    elif len(sys.argv) == 2:
-        capture = cv.CreateFileCapture(sys.argv[1])
-
-    if not capture:
-        print "Could not initialize capturing..."
-        sys.exit(-1)
-
-    cv.NamedWindow("Laplacian", 1)
-
+def main():
+    # Declare the variables we are going to use
+    ddepth = cv.CV_16S
+    smoothType = "MedianBlur"
+    sigma = 3
+    if len(sys.argv)==4:
+        ddepth = sys.argv[1]
+        smoothType = sys.argv[2]
+        sigma = sys.argv[3]
+    # Taking input from the camera
+    cap=cv.VideoCapture(0)
+    # Create Window and Trackbar
+    cv.namedWindow("Laplace of Image", cv.WINDOW_AUTOSIZE)
+    cv.createTrackbar("Kernel Size Bar", "Laplace of Image", sigma, 15, lambda x:x)
+    # Printing frame width, height and FPS
+    print("=="*40)
+    print("Frame Width: ", cap.get(cv.CAP_PROP_FRAME_WIDTH), "Frame Height: ", cap.get(cv.CAP_PROP_FRAME_HEIGHT), "FPS: ", cap.get(cv.CAP_PROP_FPS))
     while True:
-        frame = cv.QueryFrame(capture)
-        if frame:
-            if not laplace:
-                planes = [cv.CreateImage((frame.width, frame.height), 8, 1) for i in range(3)]
-                laplace = cv.CreateImage((frame.width, frame.height), cv.IPL_DEPTH_16S, 1)
-                colorlaplace = cv.CreateImage((frame.width, frame.height), 8, 3)
-
-            cv.Split(frame, planes[0], planes[1], planes[2], None)
-            for plane in planes:
-                cv.Laplace(plane, laplace, 3)
-                cv.ConvertScaleAbs(laplace, plane, 1, 0)
-
-            cv.Merge(planes[0], planes[1], planes[2], None, colorlaplace)
-
-            cv.ShowImage("Laplacian", colorlaplace)
-
-        if cv.WaitKey(10) != -1:
+        # Reading input from the camera
+        ret, frame = cap.read()
+        if ret == False:
+            print("Can't open camera/video stream")
             break
+        # Taking input/position from the trackbar
+        sigma = cv.getTrackbarPos("Kernel Size Bar", "Laplace of Image")
+        # Setting kernel size
+        ksize = (sigma*5)|1
+        # Removing noise by blurring with a filter
+        if smoothType == "GAUSSIAN":
+            smoothed = cv.GaussianBlur(frame, (ksize, ksize), sigma, sigma)
+        if smoothType == "BLUR":
+            smoothed = cv.blur(frame, (ksize, ksize))
+        if smoothType == "MedianBlur":
+            smoothed = cv.medianBlur(frame, ksize)
 
-    cv.DestroyWindow("Laplacian")
+        # Apply Laplace function
+        laplace = cv.Laplacian(smoothed, ddepth, 5)
+        # Converting back to uint8
+        result = cv.convertScaleAbs(laplace, (sigma+1)*0.25)
+        # Display Output
+        cv.imshow("Laplace of Image", result)
+        k = cv.waitKey(30)
+        if k == 27:
+            return
+if __name__ == "__main__":
+    print(__doc__)
+    main()
+    cv.destroyAllWindows()

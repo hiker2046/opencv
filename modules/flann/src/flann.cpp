@@ -27,7 +27,7 @@
  *************************************************************************/
 
 #include "precomp.hpp"
-#include "opencv2/flann/flann.hpp"
+#include "opencv2/flann.hpp"
 
 namespace cvflann
 {
@@ -53,5 +53,4 @@ namespace cvflann
         flann_distance_type_ = distance_type;
     }
 
-    void dummyfunc() {}
 }

@@ -1,9 +1,8 @@
+#include "precomp.hpp"
+#include "polynom_solver.h"
+
 #include <math.h>
 #include <iostream>
-using namespace std;
-#include "precomp.hpp"
-
-#include "polynom_solver.h"
 
 int solve_deg2(double a, double b, double c, double & x1, double & x2)
 {
@@ -33,7 +32,7 @@ int solve_deg3(double a, double b, double c, double d,
                double & x0, double & x1, double & x2)
 {
   if (a == 0) {
-    // Solve second order sytem
+    // Solve second order system
     if (b == 0)	{
       // Solve first order system
       if (c == 0)

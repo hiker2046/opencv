@@ -31,10 +31,10 @@
 #ifndef OPENCV_FLANN_HIERARCHICAL_CLUSTERING_INDEX_H_
 #define OPENCV_FLANN_HIERARCHICAL_CLUSTERING_INDEX_H_
 
+//! @cond IGNORED
+
 #include <algorithm>
-#include <string>
 #include <map>
-#include <cassert>
 #include <limits>
 #include <cmath>
 
@@ -152,7 +152,7 @@ private:
         int n = indices_length;
 
         int rnd = rand_int(n);
-        assert(rnd >=0 && rnd < n);
+        CV_DbgAssert(rnd >=0 && rnd < n);
 
         centers[0] = dsindices[rnd];
 
@@ -207,11 +207,14 @@ private:
 
         // Choose one random center and set the closestDistSq values
         int index = rand_int(n);
-        assert(index >=0 && index < n);
+        CV_DbgAssert(index >=0 && index < n);
         centers[0] = dsindices[index];
 
+        // Computing distance^2 will have the advantage of even higher probability further to pick new centers
+        // far from previous centers (and this complies to "k-means++: the advantages of careful seeding" article)
         for (int i = 0; i < n; i++) {
             closestDistSq[i] = distance(dataset[dsindices[i]], dataset[dsindices[index]], dataset.cols);
+            closestDistSq[i] = ensureSquareDistance<Distance>( closestDistSq[i] );
             currentPot += closestDistSq[i];
         }
 
@@ -237,7 +240,10 @@ private:
 
                 // Compute the new potential
                 double newPot = 0;
-                for (int i = 0; i < n; i++) newPot += std::min( distance(dataset[dsindices[i]], dataset[dsindices[index]], dataset.cols), closestDistSq[i] );
+                for (int i = 0; i < n; i++) {
+                    DistanceType dist = distance(dataset[dsindices[i]], dataset[dsindices[index]], dataset.cols);
+                    newPot += std::min( ensureSquareDistance<Distance>(dist), closestDistSq[i] );
+                }
 
                 // Store the best result
                 if ((bestNewPot < 0)||(newPot < bestNewPot)) {
@@ -249,7 +255,88 @@ private:
             // Add the appropriate center
             centers[centerCount] = dsindices[bestNewIndex];
             currentPot = bestNewPot;
-            for (int i = 0; i < n; i++) closestDistSq[i] = std::min( distance(dataset[dsindices[i]], dataset[dsindices[bestNewIndex]], dataset.cols), closestDistSq[i] );
+            for (int i = 0; i < n; i++) {
+                DistanceType dist = distance(dataset[dsindices[i]], dataset[dsindices[bestNewIndex]], dataset.cols);
+                closestDistSq[i] = std::min( ensureSquareDistance<Distance>(dist), closestDistSq[i] );
+            }
+        }
+
+        centers_length = centerCount;
+
+        delete[] closestDistSq;
+    }
+
+
+    /**
+     * Chooses the initial centers in a way inspired by Gonzales (by Pierre-Emmanuel Viel):
+     * select the first point of the list as a candidate, then parse the points list. If another
+     * point is further than current candidate from the other centers, test if it is a good center
+     * of a local aggregation. If it is, replace current candidate by this point. And so on...
+     *
+     * Used with KMeansIndex that computes centers coordinates by averaging positions of clusters points,
+     * this doesn't make a real difference with previous methods. But used with HierarchicalClusteringIndex
+     * class that pick centers among existing points instead of computing the barycenters, there is a real
+     * improvement.
+     *
+     * Params:
+     *     k = number of centers
+     *     vecs = the dataset of points
+     *     indices = indices in the dataset
+     * Returns:
+     */
+    void GroupWiseCenterChooser(int k, int* dsindices, int indices_length, int* centers, int& centers_length)
+    {
+        const float kSpeedUpFactor = 1.3f;
+
+        int n = indices_length;
+
+        DistanceType* closestDistSq = new DistanceType[n];
+
+        // Choose one random center and set the closestDistSq values
+        int index = rand_int(n);
+        CV_DbgAssert(index >=0 && index < n);
+        centers[0] = dsindices[index];
+
+        for (int i = 0; i < n; i++) {
+            closestDistSq[i] = distance(dataset[dsindices[i]], dataset[dsindices[index]], dataset.cols);
+        }
+
+
+        // Choose each center
+        int centerCount;
+        for (centerCount = 1; centerCount < k; centerCount++) {
+
+            // Repeat several trials
+            double bestNewPot = -1;
+            int bestNewIndex = 0;
+            DistanceType furthest = 0;
+            for (index = 0; index < n; index++) {
+
+                // We will test only the potential of the points further than current candidate
+                if( closestDistSq[index] > kSpeedUpFactor * (float)furthest ) {
+
+                    // Compute the new potential
+                    double newPot = 0;
+                    for (int i = 0; i < n; i++) {
+                        newPot += std::min( distance(dataset[dsindices[i]], dataset[dsindices[index]], dataset.cols)
+                                            , closestDistSq[i] );
+                    }
+
+                    // Store the best result
+                    if ((bestNewPot < 0)||(newPot <= bestNewPot)) {
+                        bestNewPot = newPot;
+                        bestNewIndex = index;
+                        furthest = closestDistSq[index];
+                    }
+                }
+            }
+
+            // Add the appropriate center
+            centers[centerCount] = dsindices[bestNewIndex];
+            for (int i = 0; i < n; i++) {
+                closestDistSq[i] = std::min( distance(dataset[dsindices[i]], dataset[dsindices[bestNewIndex]], dataset.cols)
+                                             , closestDistSq[i] );
+            }
         }
 
         centers_length = centerCount;
@@ -291,13 +378,20 @@ public:
         else if (centers_init_==FLANN_CENTERS_KMEANSPP) {
             chooseCenters = &HierarchicalClusteringIndex::chooseCentersKMeanspp;
         }
+        else if (centers_init_==FLANN_CENTERS_GROUPWISE) {
+            chooseCenters = &HierarchicalClusteringIndex::GroupWiseCenterChooser;
+        }
         else {
-            throw FLANNException("Unknown algorithm for choosing initial centers.");
+            FLANN_THROW(cv::Error::StsError, "Unknown algorithm for choosing initial centers.");
         }
 
-        trees_ = get_param(params,"trees",4);
         root = new NodePtr[trees_];
         indices = new int*[trees_];
+
+        for (int i=0; i<trees_; ++i) {
+            root[i] = NULL;
+            indices[i] = NULL;
+        }
     }
 
     HierarchicalClusteringIndex(const HierarchicalClusteringIndex&);
@@ -310,7 +404,12 @@ public:
      */
     virtual ~HierarchicalClusteringIndex()
     {
+        if (root!=NULL) {
+            delete[] root;
+        }
+
         if (indices!=NULL) {
+            free_indices();
             delete[] indices;
         }
     }
@@ -318,7 +417,7 @@ public:
     /**
      *  Returns size of index.
      */
-    size_t size() const
+    size_t size() const CV_OVERRIDE
     {
         return size_;
     }
@@ -326,7 +425,7 @@ public:
     /**
      * Returns the length of an index feature.
      */
-    size_t veclen() const
+    size_t veclen() const CV_OVERRIDE
     {
         return veclen_;
     }
@@ -336,7 +435,7 @@ public:
      * Computes the inde memory usage
      * Returns: memory used by the index
      */
-    int usedMemory() const
+    int usedMemory() const CV_OVERRIDE
     {
         return pool.usedMemory+pool.wastedMemory+memoryCounter;
     }
@@ -344,11 +443,14 @@ public:
     /**
      * Builds the index
      */
-    void buildIndex()
+    void buildIndex() CV_OVERRIDE
     {
         if (branching_<2) {
-            throw FLANNException("Branching factor must be at least 2");
+            FLANN_THROW(cv::Error::StsError, "Branching factor must be at least 2");
         }
+
+        free_indices();
+
         for (int i=0; i<trees_; ++i) {
             indices[i] = new int[size_];
             for (size_t j=0; j<size_; ++j) {
@@ -360,13 +462,13 @@ public:
     }
 
 
-    flann_algorithm_t getType() const
+    flann_algorithm_t getType() const CV_OVERRIDE
     {
         return FLANN_INDEX_HIERARCHICAL;
     }
 
 
-    void saveIndex(FILE* stream)
+    void saveIndex(FILE* stream) CV_OVERRIDE
     {
         save_value(stream, branching_);
         save_value(stream, trees_);
@@ -381,13 +483,23 @@ public:
     }
 
 
-    void loadIndex(FILE* stream)
+    void loadIndex(FILE* stream) CV_OVERRIDE
     {
+        if (root!=NULL) {
+            delete[] root;
+        }
+
+        if (indices!=NULL) {
+            free_indices();
+            delete[] indices;
+        }
+
         load_value(stream, branching_);
         load_value(stream, trees_);
         load_value(stream, centers_init_);
         load_value(stream, leaf_size_);
         load_value(stream, memoryCounter);
+
         indices = new int*[trees_];
         root = new NodePtr[trees_];
         for (int i=0; i<trees_; ++i) {
@@ -413,10 +525,11 @@ public:
      *     vec = the vector for which to search the nearest neighbors
      *     searchParams = parameters that influence the search algorithm (checks)
      */
-    void findNeighbors(ResultSet<DistanceType>& result, const ElementType* vec, const SearchParams& searchParams)
+    void findNeighbors(ResultSet<DistanceType>& result, const ElementType* vec, const SearchParams& searchParams) CV_OVERRIDE
     {
 
-        int maxChecks = get_param(searchParams,"checks",32);
+        const int maxChecks = get_param(searchParams,"checks",32);
+        const bool explore_all_trees = get_param(searchParams,"explore_all_trees",false);
 
         // Priority queue storing intermediate branches in the best-bin-first search
         Heap<BranchSt>* heap = new Heap<BranchSt>((int)size_);
@@ -424,21 +537,23 @@ public:
         std::vector<bool> checked(size_,false);
         int checks = 0;
         for (int i=0; i<trees_; ++i) {
-            findNN(root[i], result, vec, checks, maxChecks, heap, checked);
+            findNN(root[i], result, vec, checks, maxChecks, heap, checked, explore_all_trees);
+            if (!explore_all_trees && (checks >= maxChecks) && result.full())
+                break;
         }
 
         BranchSt branch;
         while (heap->popMin(branch) && (checks<maxChecks || !result.full())) {
             NodePtr node = branch.node;
-            findNN(node, result, vec, checks, maxChecks, heap, checked);
+            findNN(node, result, vec, checks, maxChecks, heap, checked, false);
         }
-        assert(result.full());
 
         delete heap;
 
+        CV_Assert(result.full());
     }
 
-    IndexParams getParameters() const
+    IndexParams getParameters() const CV_OVERRIDE
     {
         return params;
     }
@@ -447,7 +562,7 @@ public:
 private:
 
     /**
-     * Struture representing a node in the hierarchical k-means tree.
+     * Structure representing a node in the hierarchical k-means tree.
      */
     struct Node
     {
@@ -516,6 +631,20 @@ private:
     }
 
 
+    /**
+     * Release the inner elements of indices[]
+     */
+    void free_indices()
+    {
+        if (indices!=NULL) {
+            for(int i=0; i<trees_; ++i) {
+                if (indices[i]!=NULL) {
+                    delete[] indices[i];
+                    indices[i] = NULL;
+                }
+            }
+        }
+    }
 
 
     void computeLabels(int* dsindices, int indices_length,  int* centers, int centers_length, int* labels, DistanceType& cost)
@@ -613,11 +742,11 @@ private:
 
 
     void findNN(NodePtr node, ResultSet<DistanceType>& result, const ElementType* vec, int& checks, int maxChecks,
-                Heap<BranchSt>* heap, std::vector<bool>& checked)
+                Heap<BranchSt>* heap, std::vector<bool>& checked, bool explore_all_trees = false)
     {
         if (node->childs==NULL) {
-            if (checks>=maxChecks) {
-                if (result.full()) return;
+            if (!explore_all_trees && (checks>=maxChecks) && result.full()) {
+                return;
             }
             for (int i=0; i<node->size; ++i) {
                 int index = node->indices[i];
@@ -645,7 +774,7 @@ private:
                 }
             }
             delete[] domain_distances;
-            findNN(node->childs[best_index],result,vec, checks, maxChecks, heap, checked);
+            findNN(node->childs[best_index],result,vec, checks, maxChecks, heap, checked, explore_all_trees);
         }
     }
 
@@ -713,5 +842,7 @@ private:
 };
 
 }
+
+//! @endcond
 
 #endif /* OPENCV_FLANN_HIERARCHICAL_CLUSTERING_INDEX_H_ */

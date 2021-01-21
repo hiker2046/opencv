@@ -41,8 +41,10 @@
 
 #include "test_precomp.hpp"
 
-using namespace cv;
-using namespace std;
+// POSIT is not exposed to C++ API yet, so the test is disabled
+#if 0
+
+namespace opencv_test { namespace {
 
 class CV_POSITTest : public cvtest::BaseTest
 {
@@ -94,7 +96,7 @@ void CV_POSITTest::run( int start_from )
     const float flFocalLength = 760.f;
     const float flEpsilon = 0.5f;
 
-    /* Initilization */
+    /* Initialization */
     criteria.type = CV_TERMCRIT_EPS|CV_TERMCRIT_ITER;
     criteria.epsilon = flEpsilon;
     criteria.max_iter = 10000;
@@ -189,13 +191,13 @@ void CV_POSITTest::run( int start_from )
                  rotation->data.fl, translation->data.fl );
         cvReleasePOSITObject( &object );
 
-        //Mat _rotation = cvarrToMat(rotation), _true_rotation = cvarrToMat(true_rotation);
-        //Mat _translation = cvarrToMat(translation), _true_translation = cvarrToMat(true_translation);
-        code = cvtest::cmpEps2( ts, rotation, true_rotation, flEpsilon, false, "rotation matrix" );
+        Mat _rotation = cvarrToMat(rotation), _true_rotation = cvarrToMat(true_rotation);
+        Mat _translation = cvarrToMat(translation), _true_translation = cvarrToMat(true_translation);
+        code = cvtest::cmpEps2( ts, _rotation, _true_rotation, flEpsilon, false, "rotation matrix" );
         if( code < 0 )
             break;
 
-        code = cvtest::cmpEps2( ts, translation, true_translation, flEpsilon, false, "translation vector" );
+        code = cvtest::cmpEps2( ts, _translation, _true_translation, flEpsilon, false, "translation vector" );
         if( code < 0 )
             break;
     }
@@ -217,5 +219,9 @@ void CV_POSITTest::run( int start_from )
 }
 
 TEST(Calib3d_POSIT, accuracy) { CV_POSITTest test; test.safe_run(); }
+
+}} // namespace
+
+#endif
 
 /* End of file. */

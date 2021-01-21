@@ -41,8 +41,7 @@
 
 #include "test_precomp.hpp"
 
-using namespace cv;
-using namespace std;
+namespace opencv_test { namespace {
 
 TEST(MultiBandBlender, CanBlendTwoImages)
 {
@@ -73,6 +72,8 @@ TEST(MultiBandBlender, CanBlendTwoImages)
     Mat result; result_s.convertTo(result, CV_8U);
 
     Mat expected = imread(string(cvtest::TS::ptr()->get_data_path()) + "stitching/baboon_lena.png");
-    double rmsErr = norm(expected, result, NORM_L2) / sqrt(double(expected.size().area()));
-    ASSERT_LT(rmsErr, 1e-3);
+    double psnr = cvtest::PSNR(expected, result);
+    EXPECT_GE(psnr, 50);
 }
+
+}} // namespace

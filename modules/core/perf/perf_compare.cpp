@@ -1,21 +1,19 @@
 #include "perf_precomp.hpp"
 
-using namespace std;
-using namespace cv;
+namespace opencv_test
+{
 using namespace perf;
-using std::tr1::make_tuple;
-using std::tr1::get;
 
 CV_ENUM(CmpType, CMP_EQ, CMP_GT, CMP_GE, CMP_LT, CMP_LE, CMP_NE)
 
-typedef std::tr1::tuple<Size, MatType, CmpType> Size_MatType_CmpType_t;
+typedef tuple<Size, MatType, CmpType> Size_MatType_CmpType_t;
 typedef perf::TestBaseWithParam<Size_MatType_CmpType_t> Size_MatType_CmpType;
 
 PERF_TEST_P( Size_MatType_CmpType, compare,
              testing::Combine(
-                 testing::Values(TYPICAL_MAT_SIZES),
+                 testing::Values(::perf::szVGA, ::perf::sz1080p),
                  testing::Values(CV_8UC1, CV_8UC4, CV_8SC1, CV_16UC1, CV_16SC1, CV_32SC1, CV_32FC1),
-                 testing::ValuesIn(CmpType::all())
+                 CmpType::all()
                  )
              )
 {
@@ -38,7 +36,7 @@ PERF_TEST_P( Size_MatType_CmpType, compareScalar,
              testing::Combine(
                  testing::Values(TYPICAL_MAT_SIZES),
                  testing::Values(TYPICAL_MAT_TYPES),
-                 testing::ValuesIn(CmpType::all())
+                 CmpType::all()
                  )
              )
 {
@@ -52,7 +50,10 @@ PERF_TEST_P( Size_MatType_CmpType, compareScalar,
 
     declare.in(src1, src2, WARMUP_RNG).out(dst);
 
-    TEST_CYCLE() cv::compare(src1, src2, dst, cmpType);
+    int runs = (sz.width <= 640) ? 8 : 1;
+    TEST_CYCLE_MULTIRUN(runs) cv::compare(src1, src2, dst, cmpType);
 
     SANITY_CHECK(dst);
 }
+
+} // namespace

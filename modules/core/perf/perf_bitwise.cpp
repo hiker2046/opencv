@@ -1,10 +1,8 @@
 #include "perf_precomp.hpp"
 
-using namespace std;
-using namespace cv;
+namespace opencv_test
+{
 using namespace perf;
-using std::tr1::make_tuple;
-using std::tr1::get;
 
 #define TYPICAL_MAT_SIZES_BITW_ARITHM  TYPICAL_MAT_SIZES
 #define TYPICAL_MAT_TYPES_BITW_ARITHM  CV_8UC1, CV_8SC1, CV_8UC4, CV_32SC1, CV_32SC4
@@ -19,7 +17,7 @@ PERF_TEST_P(Size_MatType, bitwise_not, TYPICAL_MATS_BITW_ARITHM)
     cv::Mat c = Mat(sz, type);
 
     declare.in(a, WARMUP_RNG).out(c);
-    declare.time(100);
+    declare.iterations(200);
 
     TEST_CYCLE() cv::bitwise_not(a, c);
 
@@ -74,3 +72,4 @@ PERF_TEST_P(Size_MatType, bitwise_xor, TYPICAL_MATS_BITW_ARITHM)
     SANITY_CHECK(c);
 }
 
+} // namespace

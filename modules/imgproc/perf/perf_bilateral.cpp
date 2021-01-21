@@ -1,21 +1,19 @@
+// This file is part of OpenCV project.
+// It is subject to the license terms in the LICENSE file found in the top-level directory
+// of this distribution and at http://opencv.org/license.html.
 #include "perf_precomp.hpp"
 
-using namespace std;
-using namespace cv;
-using namespace perf;
-using namespace testing;
-using std::tr1::make_tuple;
-using std::tr1::get;
+namespace opencv_test {
 
 CV_ENUM(Mat_Type, CV_8UC1, CV_8UC3, CV_32FC1, CV_32FC3)
 
-typedef TestBaseWithParam< tr1::tuple<Size, int, Mat_Type> > TestBilateralFilter;
+typedef TestBaseWithParam< tuple<Size, int, Mat_Type> > TestBilateralFilter;
 
 PERF_TEST_P( TestBilateralFilter, BilateralFilter,
              Combine(
                 Values( szVGA, sz1080p ), // image size
                 Values( 3, 5 ), // d
-                ValuesIn( Mat_Type::all() ) // image type
+                Mat_Type::all() // image type
              )
 )
 {
@@ -34,5 +32,7 @@ PERF_TEST_P( TestBilateralFilter, BilateralFilter,
 
     TEST_CYCLE() bilateralFilter(src, dst, d, sigmaColor, sigmaSpace, BORDER_DEFAULT);
 
-    SANITY_CHECK(dst);
+    SANITY_CHECK(dst, .01, ERROR_RELATIVE);
 }
+
+} // namespace

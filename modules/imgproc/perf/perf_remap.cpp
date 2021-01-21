@@ -1,22 +1,20 @@
+// This file is part of OpenCV project.
+// It is subject to the license terms in the LICENSE file found in the top-level directory
+// of this distribution and at http://opencv.org/license.html.
 #include "perf_precomp.hpp"
 
-using namespace std;
-using namespace cv;
-using namespace perf;
-using namespace testing;
-using std::tr1::make_tuple;
-using std::tr1::get;
+namespace opencv_test {
 
 CV_ENUM(InterType, INTER_NEAREST, INTER_LINEAR, INTER_CUBIC, INTER_LANCZOS4)
 
-typedef TestBaseWithParam< tr1::tuple<Size, MatType, MatType, InterType> > TestRemap;
+typedef TestBaseWithParam< tuple<Size, MatType, MatType, InterType> > TestRemap;
 
 PERF_TEST_P( TestRemap, Remap,
              Combine(
                 Values( szVGA, sz1080p ),
                 Values( CV_16UC1, CV_16SC1, CV_32FC1 ),
                 Values( CV_16SC2, CV_32FC1, CV_32FC2 ),
-                ValuesIn( InterType::all() )
+                InterType::all()
              )
 )
 {
@@ -63,7 +61,10 @@ PERF_TEST_P( TestRemap, Remap,
 
     declare.in(src, WARMUP_RNG).out(dst).time(20);
 
-    TEST_CYCLE() remap(src, dst, map1, map2, inter_type);
+    int runs = (sz.width <= 640) ? 3 : 1;
+    TEST_CYCLE_MULTIRUN(runs) remap(src, dst, map1, map2, inter_type);
 
     SANITY_CHECK(dst);
 }
+
+} // namespace

@@ -1,20 +1,21 @@
-#include "opencv2/imgproc/imgproc.hpp"
-#include "opencv2/highgui/highgui.hpp"
+#include "opencv2/imgproc.hpp"
+#include "opencv2/highgui.hpp"
 #include <math.h>
 #include <iostream>
 
 using namespace cv;
 using namespace std;
 
-static void help()
+static void help(char** argv)
 {
     cout
-    << "\nThis program illustrates the use of findContours and drawContours\n"
-    << "The original image is put up along with the image of drawn contours\n"
-    << "Usage:\n"
-    << "./contours2\n"
-    << "\nA trackbar is put up which controls the contour level from -3 to 3\n"
-    << endl;
+        << "\nThis program illustrates the use of findContours and drawContours\n"
+        << "The original image is put up along with the image of drawn contours\n"
+        << "Usage:\n";
+    cout
+        << argv[0]
+        << "\nA trackbar is put up which controls the contour level from -3 to 3\n"
+        << endl;
 }
 
 const int w = 500;
@@ -28,19 +29,20 @@ static void on_trackbar(int, void*)
     Mat cnt_img = Mat::zeros(w, w, CV_8UC3);
     int _levels = levels - 3;
     drawContours( cnt_img, contours, _levels <= 0 ? 3 : -1, Scalar(128,255,255),
-                  3, CV_AA, hierarchy, std::abs(_levels) );
+                  3, LINE_AA, hierarchy, std::abs(_levels) );
 
     imshow("contours", cnt_img);
 }
 
-int main( int argc, char**)
+int main( int argc, char** argv)
 {
-    Mat img = Mat::zeros(w, w, CV_8UC1);
-    if(argc > 1)
+    cv::CommandLineParser parser(argc, argv, "{help h||}");
+    if (parser.has("help"))
     {
-        help();
-        return -1;
+        help(argv);
+        return 0;
     }
+    Mat img = Mat::zeros(w, w, CV_8UC1);
     //Draw 6 faces
     for( int i = 0; i < 6; i++ )
     {

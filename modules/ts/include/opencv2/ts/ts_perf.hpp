@@ -1,16 +1,14 @@
-#ifndef __OPENCV_TS_PERF_HPP__
-#define __OPENCV_TS_PERF_HPP__
+#ifndef OPENCV_TS_PERF_HPP
+#define OPENCV_TS_PERF_HPP
 
-#include "opencv2/core/core.hpp"
-#include "opencv2/features2d/features2d.hpp"
-#include "ts_gtest.h"
+#include "opencv2/ts.hpp"
 
-#ifdef HAVE_TBB
-#include "tbb/task_scheduler_init.h"
-#endif
+#include "ts_ext.hpp"
+
+#include <functional>
 
 #if !(defined(LOGD) || defined(LOGI) || defined(LOGW) || defined(LOGE))
-# if defined(ANDROID) && defined(USE_ANDROID_LOGGING)
+# if defined(__ANDROID__) && defined(USE_ANDROID_LOGGING)
 #  include <android/log.h>
 
 #  define PERF_TESTS_LOG_TAG "OpenCV_perf"
@@ -26,39 +24,51 @@
 # endif
 #endif
 
+// declare major namespaces to avoid errors on unknown namespace
+namespace cv { namespace cuda {} namespace ocl {} }
+namespace cvtest { }
+
 namespace perf
 {
+
+// Tuple stuff from Google Tests
+using testing::get;
+using testing::make_tuple;
+using testing::tuple;
+using testing::tuple_size;
+using testing::tuple_element;
+
 class TestBase;
 
 /*****************************************************************************************\
 *                Predefined typical frame sizes and typical test parameters               *
 \*****************************************************************************************/
-const cv::Size szQVGA = cv::Size(320, 240);
-const cv::Size szVGA = cv::Size(640, 480);
-const cv::Size szSVGA = cv::Size(800, 600);
-const cv::Size szXGA = cv::Size(1024, 768);
-const cv::Size szSXGA = cv::Size(1280, 1024);
-const cv::Size szWQHD = cv::Size(2560, 1440);
+const static cv::Size szQVGA = cv::Size(320, 240);
+const static cv::Size szVGA = cv::Size(640, 480);
+const static cv::Size szSVGA = cv::Size(800, 600);
+const static cv::Size szXGA = cv::Size(1024, 768);
+const static cv::Size szSXGA = cv::Size(1280, 1024);
+const static cv::Size szWQHD = cv::Size(2560, 1440);
 
-const cv::Size sznHD = cv::Size(640, 360);
-const cv::Size szqHD = cv::Size(960, 540);
-const cv::Size sz240p = szQVGA;
-const cv::Size sz720p = cv::Size(1280, 720);
-const cv::Size sz1080p = cv::Size(1920, 1080);
-const cv::Size sz1440p = szWQHD;
-const cv::Size sz2160p = cv::Size(3840, 2160);//UHDTV1 4K
-const cv::Size sz4320p = cv::Size(7680, 4320);//UHDTV2 8K
+const static cv::Size sznHD = cv::Size(640, 360);
+const static cv::Size szqHD = cv::Size(960, 540);
+const static cv::Size sz240p = szQVGA;
+const static cv::Size sz720p = cv::Size(1280, 720);
+const static cv::Size sz1080p = cv::Size(1920, 1080);
+const static cv::Size sz1440p = szWQHD;
+const static cv::Size sz2160p = cv::Size(3840, 2160);//UHDTV1 4K
+const static cv::Size sz4320p = cv::Size(7680, 4320);//UHDTV2 8K
 
-const cv::Size sz3MP = cv::Size(2048, 1536);
-const cv::Size sz5MP = cv::Size(2592, 1944);
-const cv::Size sz2K = cv::Size(2048, 2048);
+const static cv::Size sz3MP = cv::Size(2048, 1536);
+const static cv::Size sz5MP = cv::Size(2592, 1944);
+const static cv::Size sz2K = cv::Size(2048, 2048);
 
-const cv::Size szODD = cv::Size(127, 61);
+const static cv::Size szODD = cv::Size(127, 61);
 
-const cv::Size szSmall24 = cv::Size(24, 24);
-const cv::Size szSmall32 = cv::Size(32, 32);
-const cv::Size szSmall64 = cv::Size(64, 64);
-const cv::Size szSmall128 = cv::Size(128, 128);
+const static cv::Size szSmall24 = cv::Size(24, 24);
+const static cv::Size szSmall32 = cv::Size(32, 32);
+const static cv::Size szSmall64 = cv::Size(64, 64);
+const static cv::Size szSmall128 = cv::Size(128, 128);
 
 #define SZ_ALL_VGA ::testing::Values(::perf::szQVGA, ::perf::szVGA, ::perf::szSVGA)
 #define SZ_ALL_GA  ::testing::Values(::perf::szQVGA, ::perf::szVGA, ::perf::szSVGA, ::perf::szXGA, ::perf::szSXGA)
@@ -92,68 +102,65 @@ private:
 *     CV_ENUM and CV_FLAGS - macro to create printable wrappers for defines and enums     *
 \*****************************************************************************************/
 
-#define CV_ENUM(class_name, ...) \
-namespace { class CV_EXPORTS class_name {\
-public:\
-  class_name(int val = 0) : _val(val) {}\
-  operator int() const {return _val;}\
-  void PrintTo(std::ostream* os) const {\
-    const int vals[] = {__VA_ARGS__};\
-    const char* svals = #__VA_ARGS__;\
-    for(int i = 0, pos = 0; i < (int)(sizeof(vals)/sizeof(int)); ++i){\
-      while(isspace(svals[pos]) || svals[pos] == ',') ++pos;\
-      int start = pos;\
-      while(!(isspace(svals[pos]) || svals[pos] == ',' || svals[pos] == 0)) ++pos;\
-      if (_val == vals[i]) {\
-        *os << std::string(svals + start, svals + pos);\
-        return;\
-      }\
-    }\
-    *os << "UNKNOWN";\
-  }\
-  struct Container{\
-    typedef class_name value_type;\
-      Container(class_name* first, size_t len): _begin(first), _end(first+len){}\
-      const class_name* begin() const {return _begin;}\
-      const class_name* end() const {return _end;}\
-    private: class_name *_begin, *_end;\
-  };\
-  static Container all(){\
-    static int vals[] = {__VA_ARGS__};\
-    return Container((class_name*)vals, sizeof(vals)/sizeof(vals[0]));\
-  }\
-private: int _val;\
-};\
-inline void PrintTo(const class_name& t, std::ostream* os) { t.PrintTo(os); } }
+#define CV_ENUM(class_name, ...)                                                        \
+    namespace {                                                                         \
+    using namespace cv;using namespace cv::cuda; using namespace cv::ocl;               \
+    struct class_name {                                                                 \
+        class_name(int val = 0) : val_(val) {}                                          \
+        operator int() const { return val_; }                                           \
+        void PrintTo(std::ostream* os) const {                                          \
+            const int vals[] = { __VA_ARGS__ };                                         \
+            const char* svals = #__VA_ARGS__;                                           \
+            for(int i = 0, pos = 0; i < (int)(sizeof(vals)/sizeof(int)); ++i) {         \
+                while(isspace(svals[pos]) || svals[pos] == ',') ++pos;                  \
+                int start = pos;                                                        \
+                while(!(isspace(svals[pos]) || svals[pos] == ',' || svals[pos] == 0))   \
+                    ++pos;                                                              \
+                if (val_ == vals[i]) {                                                  \
+                    *os << std::string(svals + start, svals + pos);                     \
+                    return;                                                             \
+                }                                                                       \
+            }                                                                           \
+            *os << "UNKNOWN";                                                           \
+        }                                                                               \
+        static ::testing::internal::ParamGenerator<class_name> all() {                  \
+            const class_name vals[] = { __VA_ARGS__ };                                  \
+            return ::testing::ValuesIn(vals);                                           \
+        }                                                                               \
+    private: int val_;                                                                  \
+    };                                                                                  \
+    static inline void PrintTo(const class_name& t, std::ostream* os) { t.PrintTo(os); } }
 
-#define CV_FLAGS(class_name, ...) \
-class CV_EXPORTS class_name {\
-public:\
-  class_name(int val = 0) : _val(val) {}\
-  operator int() const {return _val;}\
-  void PrintTo(std::ostream* os) const {\
-    const int vals[] = {__VA_ARGS__};\
-    const char* svals = #__VA_ARGS__;\
-    int value = _val;\
-    bool first = true;\
-    for(int i = 0, pos = 0; i < (int)(sizeof(vals)/sizeof(int)); ++i){\
-      while(isspace(svals[pos]) || svals[pos] == ',') ++pos;\
-      int start = pos;\
-      while(!(isspace(svals[pos]) || svals[pos] == ',' || svals[pos] == 0)) ++pos;\
-      if ((value & vals[i]) == vals[i]) {\
-        value &= ~vals[i]; \
-        if (first) first = false; else *os << "|"; \
-        *os << std::string(svals + start, svals + pos);\
-        if (!value) return;\
-      }\
-    }\
-    if (first) *os << "UNKNOWN";\
-  }\
-private: int _val;\
-};\
-inline void PrintTo(const class_name& t, std::ostream* os) { t.PrintTo(os); }
+#define CV_FLAGS(class_name, ...)                                                       \
+    namespace {                                                                         \
+    struct class_name {                                                                 \
+        class_name(int val = 0) : val_(val) {}                                          \
+        operator int() const { return val_; }                                           \
+        void PrintTo(std::ostream* os) const {                                          \
+            using namespace cv;using namespace cv::cuda; using namespace cv::ocl;        \
+            const int vals[] = { __VA_ARGS__ };                                         \
+            const char* svals = #__VA_ARGS__;                                           \
+            int value = val_;                                                           \
+            bool first = true;                                                          \
+            for(int i = 0, pos = 0; i < (int)(sizeof(vals)/sizeof(int)); ++i) {         \
+                while(isspace(svals[pos]) || svals[pos] == ',') ++pos;                  \
+                int start = pos;                                                        \
+                while(!(isspace(svals[pos]) || svals[pos] == ',' || svals[pos] == 0))   \
+                    ++pos;                                                              \
+                if ((value & vals[i]) == vals[i]) {                                     \
+                    value &= ~vals[i];                                                  \
+                    if (first) first = false; else *os << "|";                          \
+                    *os << std::string(svals + start, svals + pos);                     \
+                    if (!value) return;                                                 \
+                }                                                                       \
+            }                                                                           \
+            if (first) *os << "UNKNOWN";                                                \
+        }                                                                               \
+    private: int val_;                                                                  \
+    };                                                                                  \
+    static inline void PrintTo(const class_name& t, std::ostream* os) { t.PrintTo(os); } }
 
-CV_ENUM(MatDepth, CV_8U, CV_8S, CV_16U, CV_16S, CV_32S, CV_32F, CV_64F, CV_USRTYPE1)
+CV_ENUM(MatDepth, CV_8U, CV_8S, CV_16U, CV_16S, CV_32S, CV_32F, CV_64F, CV_16F)
 
 /*****************************************************************************************\
 *                 Regression control utility for performance testing                      *
@@ -164,10 +171,11 @@ enum ERROR_TYPE
     ERROR_RELATIVE = 1
 };
 
-class CV_EXPORTS Regression
+class Regression
 {
 public:
     static Regression& add(TestBase* test, const std::string& name, cv::InputArray array, double eps = DBL_EPSILON, ERROR_TYPE err = ERROR_ABSOLUTE);
+    static Regression& addMoments(TestBase* test, const std::string& name, const cv::Moments & array, double eps = DBL_EPSILON, ERROR_TYPE err = ERROR_ABSOLUTE);
     static Regression& addKeypoints(TestBase* test, const std::string& name, const std::vector<cv::KeyPoint>& array, double eps = DBL_EPSILON, ERROR_TYPE err = ERROR_ABSOLUTE);
     static Regression& addMatches(TestBase* test, const std::string& name, const std::vector<cv::DMatch>& array, double eps = DBL_EPSILON, ERROR_TYPE err = ERROR_ABSOLUTE);
     static void Init(const std::string& testSuitName, const std::string& ext = ".xml");
@@ -205,26 +213,23 @@ private:
 };
 
 #define SANITY_CHECK(array, ...) ::perf::Regression::add(this, #array, array , ## __VA_ARGS__)
+#define SANITY_CHECK_MOMENTS(array, ...) ::perf::Regression::addMoments(this, #array, array , ## __VA_ARGS__)
 #define SANITY_CHECK_KEYPOINTS(array, ...) ::perf::Regression::addKeypoints(this, #array, array , ## __VA_ARGS__)
 #define SANITY_CHECK_MATCHES(array, ...) ::perf::Regression::addMatches(this, #array, array , ## __VA_ARGS__)
+#define SANITY_CHECK_NOTHING() this->setVerified()
 
-#ifdef HAVE_CUDA
-class CV_EXPORTS GpuPerf
+class GpuPerf
 {
 public:
   static bool targetDevice();
 };
 
-# define PERF_RUN_GPU()  ::perf::GpuPerf::targetDevice()
-#else
-# define PERF_RUN_GPU()  false
-#endif
-
+#define PERF_RUN_CUDA()  ::perf::GpuPerf::targetDevice()
 
 /*****************************************************************************************\
 *                            Container for performance metrics                            *
 \*****************************************************************************************/
-typedef struct CV_EXPORTS performance_metrics
+typedef struct performance_metrics
 {
     size_t bytesIn;
     size_t bytesOut;
@@ -245,37 +250,162 @@ typedef struct CV_EXPORTS performance_metrics
         TERM_TIME = 1,
         TERM_INTERRUPT = 2,
         TERM_EXCEPTION = 3,
+        TERM_SKIP_TEST = 4, // there are some limitations and test should be skipped
         TERM_UNKNOWN = -1
     };
 
     performance_metrics();
+    void clear();
 } performance_metrics;
+
+
+/*****************************************************************************************\
+*                           Strategy for performance measuring                            *
+\*****************************************************************************************/
+enum PERF_STRATEGY
+{
+    PERF_STRATEGY_DEFAULT = -1,
+    PERF_STRATEGY_BASE = 0,
+    PERF_STRATEGY_SIMPLE = 1
+};
 
 
 /*****************************************************************************************\
 *                           Base fixture for performance tests                            *
 \*****************************************************************************************/
-class CV_EXPORTS TestBase: public ::testing::Test
+#ifdef CV_COLLECT_IMPL_DATA
+// Implementation collection processing class.
+// Accumulates and shapes implementation data.
+typedef struct ImplData
+{
+    bool ipp;
+    bool icv;
+    bool ipp_mt;
+    bool ocl;
+    bool plain;
+    std::vector<int> implCode;
+    std::vector<cv::String> funName;
+
+    ImplData()
+    {
+        Reset();
+    }
+
+    void Reset()
+    {
+        cv::setImpl(0);
+        ipp = icv = ocl = ipp_mt = false;
+        implCode.clear();
+        funName.clear();
+    }
+
+    void GetImpl()
+    {
+        flagsToVars(cv::getImpl(implCode, funName));
+    }
+
+    std::vector<cv::String> GetCallsForImpl(int impl)
+    {
+        std::vector<cv::String> out;
+
+        for(int i = 0; i < (int)implCode.size(); i++)
+        {
+            if(impl == implCode[i])
+                out.push_back(funName[i]);
+        }
+        return out;
+    }
+
+    // Remove duplicate entries
+    void ShapeUp()
+    {
+        std::vector<int> savedCode;
+        std::vector<cv::String> savedName;
+
+        for(int i = 0; i < (int)implCode.size(); i++)
+        {
+            bool match = false;
+            for(int j = 0; j < (int)savedCode.size(); j++)
+            {
+                if(implCode[i] == savedCode[j] && !funName[i].compare(savedName[j]))
+                {
+                    match = true;
+                    break;
+                }
+            }
+            if(!match)
+            {
+                savedCode.push_back(implCode[i]);
+                savedName.push_back(funName[i]);
+            }
+        }
+
+        implCode = savedCode;
+        funName = savedName;
+    }
+
+    // convert flags register to more handy variables
+    void flagsToVars(int flags)
+    {
+#if defined(HAVE_IPP_ICV)
+        ipp    = 0;
+        icv    = ((flags&CV_IMPL_IPP) > 0);
+#else
+        ipp    = ((flags&CV_IMPL_IPP) > 0);
+        icv    = 0;
+#endif
+        ipp_mt = ((flags&CV_IMPL_MT) > 0);
+        ocl    = ((flags&CV_IMPL_OCL) > 0);
+        plain  = (flags == 0);
+    }
+
+} ImplData;
+#endif
+
+#ifdef ENABLE_INSTRUMENTATION
+class InstumentData
+{
+public:
+    static ::cv::String treeToString();
+    static void         printTree();
+};
+#endif
+
+class TestBase: public ::testing::Test
 {
 public:
     TestBase();
 
     static void Init(int argc, const char* const argv[]);
+    static void Init(const std::vector<std::string> & availableImpls,
+                     int argc, const char* const argv[]);
+    static void RecordRunParameters();
     static std::string getDataPath(const std::string& relativePath);
+    static std::string getSelectedImpl();
+
+    static enum PERF_STRATEGY getCurrentModulePerformanceStrategy();
+    static enum PERF_STRATEGY setModulePerformanceStrategy(enum PERF_STRATEGY strategy);
+
+    class PerfSkipTestException: public cvtest::SkipTestException
+    {
+    public:
+        int dummy; // workaround for MacOSX Xcode 7.3 bug (don't make class "empty")
+        PerfSkipTestException() : dummy(0) {}
+    };
 
 protected:
     virtual void PerfTestBody() = 0;
 
-    virtual void SetUp();
-    virtual void TearDown();
+    virtual void SetUp() CV_OVERRIDE;
+    virtual void TearDown() CV_OVERRIDE;
 
-    void startTimer();
+    bool startTimer(); // bool is dummy for conditional loop
     void stopTimer();
     bool next();
 
-    //_declareHelper declare;
+    PERF_STRATEGY getCurrentPerformanceStrategy() const;
 
-    enum
+    enum WarmUpType
     {
         WARMUP_READ,
         WARMUP_WRITE,
@@ -284,10 +414,19 @@ protected:
     };
 
     void reportMetrics(bool toJUnitXML = false);
-    static void warmup(cv::InputOutputArray a, int wtype = WARMUP_READ);
+    static void warmup(cv::InputOutputArray a, WarmUpType wtype = WARMUP_READ);
 
     performance_metrics& calcMetrics();
+
     void RunPerfTestBody();
+
+#ifdef CV_COLLECT_IMPL_DATA
+    ImplData implConf;
+#endif
+#ifdef ENABLE_INSTRUMENTATION
+    InstumentData instrConf;
+#endif
+
 private:
     typedef std::vector<std::pair<int, cv::Size> > SizeVector;
     typedef std::vector<int64> TimeVector;
@@ -297,6 +436,8 @@ private:
     unsigned int getTotalInputSize() const;
     unsigned int getTotalOutputSize() const;
 
+    enum PERF_STRATEGY testStrategy;
+
     TimeVector times;
     int64 lastTime;
     int64 totalTime;
@@ -304,9 +445,11 @@ private:
     static int64 timeLimitDefault;
     static unsigned int iterationsLimitDefault;
 
+    unsigned int minIters;
     unsigned int nIters;
     unsigned int currentIter;
     unsigned int runsPerIteration;
+    unsigned int perfValidationStage;
 
     performance_metrics metrics;
     void validateMetrics();
@@ -314,28 +457,30 @@ private:
     static int64 _timeadjustment;
     static int64 _calibrate();
 
-    static void warmup_impl(cv::Mat m, int wtype);
+    static void warmup_impl(cv::Mat m, WarmUpType wtype);
     static int getSizeInBytes(cv::InputArray a);
     static cv::Size getSize(cv::InputArray a);
-    static void declareArray(SizeVector& sizes, cv::InputOutputArray a, int wtype = 0);
+    static void declareArray(SizeVector& sizes, cv::InputOutputArray a, WarmUpType wtype);
 
-    class CV_EXPORTS _declareHelper
+    class _declareHelper
     {
     public:
-        _declareHelper& in(cv::InputOutputArray a1, int wtype = WARMUP_READ);
-        _declareHelper& in(cv::InputOutputArray a1, cv::InputOutputArray a2, int wtype = WARMUP_READ);
-        _declareHelper& in(cv::InputOutputArray a1, cv::InputOutputArray a2, cv::InputOutputArray a3, int wtype = WARMUP_READ);
-        _declareHelper& in(cv::InputOutputArray a1, cv::InputOutputArray a2, cv::InputOutputArray a3, cv::InputOutputArray a4, int wtype = WARMUP_READ);
+        _declareHelper& in(cv::InputOutputArray a1, WarmUpType wtype = WARMUP_READ);
+        _declareHelper& in(cv::InputOutputArray a1, cv::InputOutputArray a2, WarmUpType wtype = WARMUP_READ);
+        _declareHelper& in(cv::InputOutputArray a1, cv::InputOutputArray a2, cv::InputOutputArray a3, WarmUpType wtype = WARMUP_READ);
+        _declareHelper& in(cv::InputOutputArray a1, cv::InputOutputArray a2, cv::InputOutputArray a3, cv::InputOutputArray a4, WarmUpType wtype = WARMUP_READ);
 
-        _declareHelper& out(cv::InputOutputArray a1, int wtype = WARMUP_WRITE);
-        _declareHelper& out(cv::InputOutputArray a1, cv::InputOutputArray a2, int wtype = WARMUP_WRITE);
-        _declareHelper& out(cv::InputOutputArray a1, cv::InputOutputArray a2, cv::InputOutputArray a3, int wtype = WARMUP_WRITE);
-        _declareHelper& out(cv::InputOutputArray a1, cv::InputOutputArray a2, cv::InputOutputArray a3, cv::InputOutputArray a4, int wtype = WARMUP_WRITE);
+        _declareHelper& out(cv::InputOutputArray a1, WarmUpType wtype = WARMUP_WRITE);
+        _declareHelper& out(cv::InputOutputArray a1, cv::InputOutputArray a2, WarmUpType wtype = WARMUP_WRITE);
+        _declareHelper& out(cv::InputOutputArray a1, cv::InputOutputArray a2, cv::InputOutputArray a3, WarmUpType wtype = WARMUP_WRITE);
+        _declareHelper& out(cv::InputOutputArray a1, cv::InputOutputArray a2, cv::InputOutputArray a3, cv::InputOutputArray a4, WarmUpType wtype = WARMUP_WRITE);
 
         _declareHelper& iterations(unsigned int n);
         _declareHelper& time(double timeLimitSecs);
         _declareHelper& tbb_threads(int n = -1);
         _declareHelper& runs(unsigned int runsNumber);
+
+        _declareHelper& strategy(enum PERF_STRATEGY s);
     private:
         TestBase* test;
         _declareHelper(TestBase* t);
@@ -344,30 +489,32 @@ private:
         friend class TestBase;
     };
     friend class _declareHelper;
-    friend class Regression;
 
     bool verified;
 
 public:
     _declareHelper declare;
+
+    void setVerified() { this->verified = true; }
 };
 
 template<typename T> class TestBaseWithParam: public TestBase, public ::testing::WithParamInterface<T> {};
 
-typedef std::tr1::tuple<cv::Size, MatType> Size_MatType_t;
+typedef tuple<cv::Size, MatType> Size_MatType_t;
 typedef TestBaseWithParam<Size_MatType_t> Size_MatType;
 
 /*****************************************************************************************\
 *                              Print functions for googletest                             *
 \*****************************************************************************************/
-CV_EXPORTS void PrintTo(const MatType& t, std::ostream* os);
+void PrintTo(const MatType& t, std::ostream* os);
 
 } //namespace perf
 
 namespace cv
 {
 
-CV_EXPORTS void PrintTo(const Size& sz, ::std::ostream* os);
+void PrintTo(const String& str, ::std::ostream* os);
+void PrintTo(const Size& sz, ::std::ostream* os);
 
 } //namespace cv
 
@@ -375,6 +522,22 @@ CV_EXPORTS void PrintTo(const Size& sz, ::std::ostream* os);
 /*****************************************************************************************\
 *                        Macro definitions for performance tests                          *
 \*****************************************************************************************/
+
+#define CV__PERF_TEST_BODY_IMPL(name) \
+    { \
+       CV__TEST_NAMESPACE_CHECK \
+       CV__TRACE_APP_FUNCTION_NAME("PERF_TEST: " name); \
+       try { \
+       ::cvtest::testSetUp(); \
+       RunPerfTestBody(); \
+       } \
+       catch (cvtest::details::SkipTestExceptionBase& e) \
+       { \
+          printf("[     SKIP ] %s\n", e.what()); \
+       } \
+       ::cvtest::testTearDown(); \
+    }
+
 #define PERF_PROXY_NAMESPACE_NAME_(test_case_name, test_name) \
   test_case_name##_##test_name##_perf_namespace_proxy
 
@@ -391,17 +554,7 @@ CV_EXPORTS void PrintTo(const Size& sz, ::std::ostream* os);
 //     EXPECT_TRUE(foo.StatusIsOK());
 //   }
 #define PERF_TEST(test_case_name, test_name)\
-    namespace PERF_PROXY_NAMESPACE_NAME_(test_case_name, test_name) {\
-     class TestBase {/*compile error for this class means that you are trying to use perf::TestBase as a fixture*/};\
-     class test_case_name : public ::perf::TestBase {\
-      public:\
-       test_case_name() {}\
-      protected:\
-       virtual void PerfTestBody();\
-     };\
-     TEST_F(test_case_name, test_name){ RunPerfTestBody(); }\
-    }\
-    void PERF_PROXY_NAMESPACE_NAME_(test_case_name, test_name)::test_case_name::PerfTestBody()
+    TEST_(test_case_name, test_name, ::perf::TestBase, PerfTestBody, CV__PERF_TEST_BODY_IMPL)
 
 // Defines a performance test that uses a test fixture.
 //
@@ -437,11 +590,19 @@ CV_EXPORTS void PrintTo(const Size& sz, ::std::ostream* os);
       protected:\
        virtual void PerfTestBody();\
      };\
-     TEST_F(fixture, testname){ RunPerfTestBody(); }\
+     TEST_F(fixture, testname){ CV__PERF_TEST_BODY_IMPL(#fixture "_" #testname); }\
     }\
     void PERF_PROXY_NAMESPACE_NAME_(fixture, testname)::fixture::PerfTestBody()
 
 // Defines a parametrized performance test.
+//
+// @Note PERF_TEST_P() below violates behavior of original Google Tests - there is no tests instantiation in original TEST_P()
+// This macro is intended for usage with separate INSTANTIATE_TEST_CASE_P macro
+#define PERF_TEST_P_(test_case_name, test_name) CV__TEST_P(test_case_name, test_name, PerfTestBody, CV__PERF_TEST_BODY_IMPL)
+
+// Defines a parametrized performance test.
+//
+// @Note Original TEST_P() macro doesn't instantiate tests with parameters. To keep original usage use PERF_TEST_P_() macro
 //
 // The first parameter is the name of the test fixture class, which
 // also doubles as the test case name.  The second parameter is the
@@ -470,24 +631,62 @@ CV_EXPORTS void PrintTo(const Size& sz, ::std::ostream* os);
      protected:\
       virtual void PerfTestBody();\
     };\
-    TEST_P(fixture##_##name, name /*perf*/){ RunPerfTestBody(); }\
+    CV__TEST_P(fixture##_##name, name, PerfTestBodyDummy, CV__PERF_TEST_BODY_IMPL){} \
     INSTANTIATE_TEST_CASE_P(/*none*/, fixture##_##name, params);\
     void fixture##_##name::PerfTestBody()
 
+#ifndef __CV_TEST_EXEC_ARGS
+#if defined(_MSC_VER) && (_MSC_VER <= 1400)
+#define __CV_TEST_EXEC_ARGS(...)    \
+    while (++argc >= (--argc,-1)) {__VA_ARGS__; break;} /*this ugly construction is needed for VS 2005*/
+#else
+#define __CV_TEST_EXEC_ARGS(...)    \
+    __VA_ARGS__;
+#endif
+#endif
 
-#define CV_PERF_TEST_MAIN(testsuitname, ...) \
+
+#define CV_PERF_TEST_MAIN_INTERNALS(modulename, impls, ...)	\
+    CV_TRACE_FUNCTION(); \
+    { CV_TRACE_REGION("INIT"); \
+    ::perf::Regression::Init(#modulename); \
+    ::perf::TestBase::Init(std::vector<std::string>(impls, impls + sizeof impls / sizeof *impls), \
+                           argc, argv); \
+    ::testing::InitGoogleTest(&argc, argv); \
+    ::testing::UnitTest::GetInstance()->listeners().Append(new cvtest::SystemInfoCollector); \
+    ::testing::Test::RecordProperty("cv_module_name", #modulename); \
+    ::perf::TestBase::RecordRunParameters(); \
+    __CV_TEST_EXEC_ARGS(__VA_ARGS__) \
+    } \
+    return RUN_ALL_TESTS();
+
+// impls must be an array, not a pointer; "plain" should always be one of the implementations
+#define CV_PERF_TEST_MAIN_WITH_IMPLS(modulename, impls, ...) \
 int main(int argc, char **argv)\
 {\
-    while (++argc >= (--argc,-1)) {__VA_ARGS__; break;} /*this ugly construction is needed for VS 2005*/\
-    ::perf::Regression::Init(#testsuitname);\
-    ::perf::TestBase::Init(argc, argv);\
-    ::testing::InitGoogleTest(&argc, argv);\
-    return RUN_ALL_TESTS();\
+    CV_PERF_TEST_MAIN_INTERNALS(modulename, impls, __VA_ARGS__)\
 }
 
-#define TEST_CYCLE_N(n) for(declare.iterations(n); startTimer(), next(); stopTimer())
-#define TEST_CYCLE() for(; startTimer(), next(); stopTimer())
-#define TEST_CYCLE_MULTIRUN(runsNum) for(declare.runs(runsNum); startTimer(), next(); stopTimer()) for(int r = 0; r < runsNum; ++r)
+#define CV_PERF_TEST_MAIN(modulename, ...) \
+int main(int argc, char **argv)\
+{\
+    const char * plain_only[] = { "plain" };\
+    CV_PERF_TEST_MAIN_INTERNALS(modulename, plain_only, __VA_ARGS__)\
+}
+
+//! deprecated
+#define TEST_CYCLE_N(n) for(declare.iterations(n); next() && startTimer(); stopTimer())
+//! deprecated
+#define TEST_CYCLE() for(; next() && startTimer(); stopTimer())
+//! deprecated
+#define TEST_CYCLE_MULTIRUN(runsNum) for(declare.runs(runsNum); next() && startTimer(); stopTimer()) for(int r = 0; r < runsNum; ++r)
+
+#define PERF_SAMPLE_BEGIN() \
+    for(; next() && startTimer(); stopTimer()) \
+    { \
+        CV_TRACE_REGION("iteration");
+#define PERF_SAMPLE_END() \
+    }
 
 namespace perf
 {
@@ -495,38 +694,38 @@ namespace comparators
 {
 
 template<typename T>
-struct CV_EXPORTS RectLess_
+struct RectLess_
 {
   bool operator()(const cv::Rect_<T>& r1, const cv::Rect_<T>& r2) const
   {
-    return r1.x < r2.x
-      || (r1.x == r2.x && r1.y < r2.y)
-      || (r1.x == r2.x && r1.y == r2.y && r1.width < r2.width)
-      || (r1.x == r2.x && r1.y == r2.y && r1.width == r2.width && r1.height < r2.height);
+    return r1.x < r2.x ||
+            (r1.x == r2.x && r1.y < r2.y) ||
+            (r1.x == r2.x && r1.y == r2.y && r1.width < r2.width) ||
+            (r1.x == r2.x && r1.y == r2.y && r1.width == r2.width && r1.height < r2.height);
   }
 };
 
 typedef RectLess_<int> RectLess;
 
-struct CV_EXPORTS KeypointGreater
+struct KeypointGreater
 {
     bool operator()(const cv::KeyPoint& kp1, const cv::KeyPoint& kp2) const
     {
-        if(kp1.response > kp2.response) return true;
-        if(kp1.response < kp2.response) return false;
-        if(kp1.size > kp2.size) return true;
-        if(kp1.size < kp2.size) return false;
-        if(kp1.octave > kp2.octave) return true;
-        if(kp1.octave < kp2.octave) return false;
-        if(kp1.pt.y < kp2.pt.y) return false;
-        if(kp1.pt.y > kp2.pt.y) return true;
+        if (kp1.response > kp2.response) return true;
+        if (kp1.response < kp2.response) return false;
+        if (kp1.size > kp2.size) return true;
+        if (kp1.size < kp2.size) return false;
+        if (kp1.octave > kp2.octave) return true;
+        if (kp1.octave < kp2.octave) return false;
+        if (kp1.pt.y < kp2.pt.y) return false;
+        if (kp1.pt.y > kp2.pt.y) return true;
         return kp1.pt.x < kp2.pt.x;
     }
 };
 
 } //namespace comparators
 
-void CV_EXPORTS sort(std::vector<cv::KeyPoint>& pts, cv::InputOutputArray descriptors);
+void sort(std::vector<cv::KeyPoint>& pts, cv::InputOutputArray descriptors);
 } //namespace perf
 
-#endif //__OPENCV_TS_PERF_HPP__
+#endif //OPENCV_TS_PERF_HPP

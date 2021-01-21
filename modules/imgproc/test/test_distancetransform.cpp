@@ -41,8 +41,7 @@
 
 #include "test_precomp.hpp"
 
-using namespace cv;
-using namespace std;
+namespace opencv_test { namespace {
 
 class CV_DisTransTest : public cvtest::ArrayTest
 {
@@ -90,30 +89,20 @@ void CV_DisTransTest::get_test_array_types_and_sizes( int test_case_idx,
     if( cvtest::randInt(rng) & 1 )
     {
         mask_size = 3;
-        dist_type = cvtest::randInt(rng) % 4;
-        dist_type = dist_type == 0 ? CV_DIST_C : dist_type == 1 ? CV_DIST_L1 :
-                    dist_type == 2 ? CV_DIST_L2 : CV_DIST_USER;
     }
     else
     {
         mask_size = 5;
-        dist_type = cvtest::randInt(rng) % 10;
-        dist_type = dist_type == 0 ? CV_DIST_C : dist_type == 1 ? CV_DIST_L1 :
-                    dist_type < 6 ? CV_DIST_L2 : CV_DIST_USER;
     }
+
+    dist_type = cvtest::randInt(rng) % 3;
+    dist_type = dist_type == 0 ? CV_DIST_C : dist_type == 1 ? CV_DIST_L1 : CV_DIST_L2;
 
     // for now, check only the "labeled" distance transform mode
     fill_labels = 0;
 
     if( !fill_labels )
         sizes[OUTPUT][1] = sizes[REF_OUTPUT][1] = cvSize(0,0);
-
-    if( dist_type == CV_DIST_USER )
-    {
-        mask[0] = (float)(1.1 - cvtest::randReal(rng)*0.2);
-        mask[1] = (float)(1.9 - cvtest::randReal(rng)*0.8);
-        mask[2] = (float)(3. - cvtest::randReal(rng));
-    }
 }
 
 
@@ -168,7 +157,7 @@ cvTsDistTransform( const CvMat* _src, CvMat* _dst, int dist_type,
     const float init_val = 1e6;
     float mask[3];
     CvMat* temp;
-    int ofs[16];
+    int ofs[16] = {0};
     float delta[16];
     int tstep, count;
 
@@ -286,7 +275,7 @@ cvTsDistTransform( const CvMat* _src, CvMat* _dst, int dist_type,
 
 void CV_DisTransTest::prepare_to_validation( int /*test_case_idx*/ )
 {
-    CvMat _input = test_mat[INPUT][0], _output = test_mat[REF_OUTPUT][0];
+    CvMat _input = cvMat(test_mat[INPUT][0]), _output = cvMat(test_mat[REF_OUTPUT][0]);
 
     cvTsDistTransform( &_input, &_output, dist_type, mask_size, mask, 0 );
 }
@@ -294,4 +283,23 @@ void CV_DisTransTest::prepare_to_validation( int /*test_case_idx*/ )
 
 TEST(Imgproc_DistanceTransform, accuracy) { CV_DisTransTest test; test.safe_run(); }
 
+BIGDATA_TEST(Imgproc_DistanceTransform, large_image_12218)
+{
+    const int lls_maxcnt = 79992000;   // labels's maximum count
+    const int lls_mincnt = 1;          // labels's minimum count
+    int i, j, nz;
+    Mat src(8000, 20000, CV_8UC1), dst, labels;
+    for( i = 0; i < src.rows; i++ )
+        for( j = 0; j < src.cols; j++ )
+            src.at<uchar>(i, j) = (j > (src.cols / 2)) ? 0 : 255;
 
+    distanceTransform(src, dst, labels, cv::DIST_L2, cv::DIST_MASK_3, DIST_LABEL_PIXEL);
+
+    double scale = (double)lls_mincnt / (double)lls_maxcnt;
+    labels.convertTo(labels, CV_32SC1, scale);
+    Size size = labels.size();
+    nz = cv::countNonZero(labels);
+    EXPECT_EQ(nz, (size.height*size.width / 2));
+}
+
+}} // namespace

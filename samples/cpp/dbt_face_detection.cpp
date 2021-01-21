@@ -1,14 +1,13 @@
-#if defined(__linux__) || defined(LINUX) || defined(__APPLE__) || defined(ANDROID)
+#if defined(__linux__) || defined(LINUX) || defined(__APPLE__) || defined(ANDROID) || (defined(_MSC_VER) && _MSC_VER>=1800)
 
-#include <opencv2/imgproc/imgproc.hpp>  // Gaussian Blur
-#include <opencv2/core/core.hpp>        // Basic OpenCV structures (cv::Mat, Scalar)
-#include <opencv2/highgui/highgui.hpp>  // OpenCV window I/O
-#include <opencv2/features2d/features2d.hpp>
-#include <opencv2/contrib/detection_based_tracker.hpp>
+#include <opencv2/imgproc.hpp>  // Gaussian Blur
+#include <opencv2/core.hpp>        // Basic OpenCV structures (cv::Mat, Scalar)
+#include <opencv2/videoio.hpp>
+#include <opencv2/highgui.hpp>  // OpenCV window I/O
+#include <opencv2/features2d.hpp>
+#include <opencv2/objdetect.hpp>
 
 #include <stdio.h>
-#include <string>
-#include <vector>
 
 using namespace std;
 using namespace cv;
@@ -22,15 +21,15 @@ class CascadeDetectorAdapter: public DetectionBasedTracker::IDetector
             IDetector(),
             Detector(detector)
         {
-            CV_Assert(!detector.empty());
+            CV_Assert(detector);
         }
 
-        void detect(const cv::Mat &Image, std::vector<cv::Rect> &objects)
+        void detect(const cv::Mat &Image, std::vector<cv::Rect> &objects) CV_OVERRIDE
         {
             Detector->detectMultiScale(Image, objects, scaleFactor, minNeighbours, 0, minObjSize, maxObjSize);
         }
 
-        virtual ~CascadeDetectorAdapter()
+        virtual ~CascadeDetectorAdapter() CV_OVERRIDE
         {}
 
     private:
@@ -50,12 +49,22 @@ int main(int , char** )
         return 1;
     }
 
-    std::string cascadeFrontalfilename = "../../data/lbpcascades/lbpcascade_frontalface.xml";
-    cv::Ptr<cv::CascadeClassifier> cascade = new cv::CascadeClassifier(cascadeFrontalfilename);
-    cv::Ptr<DetectionBasedTracker::IDetector> MainDetector = new CascadeDetectorAdapter(cascade);
+    std::string cascadeFrontalfilename = samples::findFile("data/lbpcascades/lbpcascade_frontalface.xml");
+    cv::Ptr<cv::CascadeClassifier> cascade = makePtr<cv::CascadeClassifier>(cascadeFrontalfilename);
+    cv::Ptr<DetectionBasedTracker::IDetector> MainDetector = makePtr<CascadeDetectorAdapter>(cascade);
+    if ( cascade->empty() )
+    {
+      printf("Error: Cannot load %s\n", cascadeFrontalfilename.c_str());
+      return 2;
+    }
 
-    cascade = new cv::CascadeClassifier(cascadeFrontalfilename);
-    cv::Ptr<DetectionBasedTracker::IDetector> TrackingDetector = new CascadeDetectorAdapter(cascade);
+    cascade = makePtr<cv::CascadeClassifier>(cascadeFrontalfilename);
+    cv::Ptr<DetectionBasedTracker::IDetector> TrackingDetector = makePtr<CascadeDetectorAdapter>(cascade);
+    if ( cascade->empty() )
+    {
+      printf("Error: Cannot load %s\n", cascadeFrontalfilename.c_str());
+      return 2;
+    }
 
     DetectionBasedTracker::Parameters params;
     DetectionBasedTracker Detector(MainDetector, TrackingDetector, params);
@@ -70,22 +79,20 @@ int main(int , char** )
     Mat GrayFrame;
     vector<Rect> Faces;
 
-    while(true)
+    do
     {
         VideoStream >> ReferenceFrame;
-        cvtColor(ReferenceFrame, GrayFrame, COLOR_RGB2GRAY);
+        cvtColor(ReferenceFrame, GrayFrame, COLOR_BGR2GRAY);
         Detector.process(GrayFrame);
         Detector.getObjects(Faces);
 
         for (size_t i = 0; i < Faces.size(); i++)
         {
-            rectangle(ReferenceFrame, Faces[i], CV_RGB(0,255,0));
+            rectangle(ReferenceFrame, Faces[i], Scalar(0,255,0));
         }
 
         imshow(WindowName, ReferenceFrame);
-
-        if (cvWaitKey(30) >= 0) break;
-    }
+    } while (waitKey(30) < 0);
 
     Detector.stop();
 
@@ -97,7 +104,7 @@ int main(int , char** )
 #include <stdio.h>
 int main()
 {
-    printf("This sample works for UNIX or ANDROID only\n");
+    printf("This sample works for UNIX or ANDROID or Visual Studio 2013+ only\n");
     return 0;
 }
 

@@ -40,6 +40,7 @@
 //M*/
 
 #include "precomp.hpp"
+#include "opencv2/core/core_c.h"
 
 namespace cvtest
 {
@@ -79,15 +80,15 @@ void ArrayTest::clear()
 }
 
 
-int ArrayTest::read_params( CvFileStorage* fs )
+int ArrayTest::read_params( const cv::FileStorage& fs )
 {
     int code = BaseTest::read_params( fs );
     if( code < 0 )
         return code;
 
-    min_log_array_size = cvReadInt( find_param( fs, "min_log_array_size" ), min_log_array_size );
-    max_log_array_size = cvReadInt( find_param( fs, "max_log_array_size" ), max_log_array_size );
-    test_case_count = cvReadInt( find_param( fs, "test_case_count" ), test_case_count );
+    read( find_param( fs, "min_log_array_size" ), min_log_array_size, min_log_array_size );
+    read( find_param( fs, "max_log_array_size" ), max_log_array_size, max_log_array_size );
+    read( find_param( fs, "test_case_count" ), test_case_count, test_case_count );
     test_case_count = cvRound( test_case_count*ts->get_test_case_count_scale() );
 
     min_log_array_size = clipInt( min_log_array_size, 0, 20 );
@@ -122,7 +123,7 @@ void ArrayTest::get_test_array_types_and_sizes( int /*test_case_idx*/, vector<ve
 }
 
 
-static const int icvTsTypeToDepth[] =
+static const unsigned int icvTsTypeToDepth[] =
 {
     IPL_DEPTH_8U, IPL_DEPTH_8S, IPL_DEPTH_16U, IPL_DEPTH_16S,
     IPL_DEPTH_32S, IPL_DEPTH_32F, IPL_DEPTH_64F
@@ -157,8 +158,8 @@ int ArrayTest::prepare_test_case( int test_case_idx )
         {
             unsigned t = randInt(rng);
             bool create_mask = true, use_roi = false;
-            CvSize size = sizes[i][j], whole_size = size;
-            CvRect roi = {0,0,0,0};
+            CvSize size = cvSize(sizes[i][j]), whole_size = size;
+            CvRect roi = CV_STRUCT_INITIALIZER;
 
             is_image = !cvmat_allowed ? true : iplimage_allowed ? (t & 1) != 0 : false;
             create_mask = (t & 6) == 0; // ~ each of 3 tests will use mask
@@ -296,37 +297,15 @@ int ArrayTest::validate_test_results( int test_case_idx )
         for( j = 0; j < sizei; j++ )
         {
             double err_level;
-            vector<int> idx;
-            double max_diff = 0;
             int code;
-            char msg[100];
 
             if( !test_array[i1][j] )
                 continue;
 
             err_level = get_success_error_level( test_case_idx, i0, (int)j );
-            code = cmpEps( test_mat[i0][j], test_mat[i1][j], &max_diff, err_level, &idx, element_wise_relative_error );
+            code = cmpEps2(ts, test_mat[i0][j], test_mat[i1][j], err_level, element_wise_relative_error, arr_names[i0]);
 
-            switch( code )
-            {
-            case -1:
-                sprintf( msg, "Too big difference (=%g)", max_diff );
-                code = TS::FAIL_BAD_ACCURACY;
-                break;
-            case -2:
-                strcpy( msg, "Invalid output" );
-                code = TS::FAIL_INVALID_OUTPUT;
-                break;
-            case -3:
-                strcpy( msg, "Invalid output in the reference array" );
-                code = TS::FAIL_INVALID_OUTPUT;
-                break;
-            default:
-                continue;
-            }
-            string idxstr = vec2str(", ", &idx[0], idx.size());
-
-            ts->printf( TS::LOG, "%s in %s array %d at (%s)", msg, arr_names[i0], j, idxstr.c_str() );
+            if (code == 0) continue;
 
             for( i0 = 0; i0 < (int)test_array.size(); i0++ )
             {

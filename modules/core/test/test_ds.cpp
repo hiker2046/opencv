@@ -1,7 +1,9 @@
+// This file is part of OpenCV project.
+// It is subject to the license terms in the LICENSE file found in the top-level directory
+// of this distribution and at http://opencv.org/license.html.
 #include "test_precomp.hpp"
 
-using namespace cv;
-using namespace std;
+namespace opencv_test { namespace {
 
 typedef  struct  CvTsSimpleSeq
 {
@@ -56,7 +58,7 @@ static void cvTsSimpleSeqShiftAndCopy( CvTsSimpleSeq* seq, int from_idx, int to_
                 (seq->count - from_idx)*elem_size );
     }
     seq->count += to_idx - from_idx;
-    if( elem && to_idx > from_idx )
+    if( elem )
         memcpy( seq->array + from_idx*elem_size, elem, (to_idx - from_idx)*elem_size );
 }
 
@@ -325,7 +327,7 @@ public:
     void clear();
 
 protected:
-    int read_params( CvFileStorage* fs );
+    int read_params( const cv::FileStorage& fs );
     void run_func(void);
     void set_error_context( const char* condition,
                            const char* err_msg,
@@ -358,8 +360,6 @@ Core_DynStructBaseTest::Core_DynStructBaseTest()
     iterations = max_struct_size*2;
     gen = struct_idx = iter = -1;
     test_progress = -1;
-
-    storage = 0;
 }
 
 
@@ -385,26 +385,26 @@ void Core_DynStructBaseTest::clear()
 }
 
 
-int Core_DynStructBaseTest::read_params( CvFileStorage* fs )
+int Core_DynStructBaseTest::read_params( const cv::FileStorage& fs )
 {
     int code = cvtest::BaseTest::read_params( fs );
     double sqrt_scale = sqrt(ts->get_test_case_count_scale());
     if( code < 0 )
         return code;
 
-    struct_count = cvReadInt( find_param( fs, "struct_count" ), struct_count );
-    max_struct_size = cvReadInt( find_param( fs, "max_struct_size" ), max_struct_size );
-    generations = cvReadInt( find_param( fs, "generations" ), generations );
-    iterations = cvReadInt( find_param( fs, "iterations" ), iterations );
+    read( find_param( fs, "struct_count" ), struct_count, struct_count );
+    read( find_param( fs, "max_struct_size" ), max_struct_size, max_struct_size );
+    read( find_param( fs, "generations" ), generations, generations );
+    read( find_param( fs, "iterations" ), iterations, iterations );
     generations = cvRound(generations*sqrt_scale);
     iterations = cvRound(iterations*sqrt_scale);
 
-    min_log_storage_block_size = cvReadInt( find_param( fs, "min_log_storage_block_size" ),
-                                           min_log_storage_block_size );
-    max_log_storage_block_size = cvReadInt( find_param( fs, "max_log_storage_block_size" ),
-                                           max_log_storage_block_size );
-    min_log_elem_size = cvReadInt( find_param( fs, "min_log_elem_size" ), min_log_elem_size );
-    max_log_elem_size = cvReadInt( find_param( fs, "max_log_elem_size" ), max_log_elem_size );
+    read( find_param( fs, "min_log_storage_block_size" ),
+              min_log_storage_block_size, min_log_storage_block_size );
+    read( find_param( fs, "max_log_storage_block_size" ),
+              max_log_storage_block_size, max_log_storage_block_size );
+    read( find_param( fs, "min_log_elem_size" ), min_log_elem_size, min_log_elem_size );
+    read( find_param( fs, "max_log_elem_size" ), max_log_elem_size, max_log_elem_size );
 
     struct_count = cvtest::clipInt( struct_count, 1, 100 );
     max_struct_size = cvtest::clipInt( max_struct_size, 1, 1<<20 );
@@ -493,6 +493,7 @@ class Core_SeqBaseTest : public Core_DynStructBaseTest
 {
 public:
     Core_SeqBaseTest();
+    virtual ~Core_SeqBaseTest();
     void clear();
     void run( int );
 
@@ -503,11 +504,14 @@ protected:
     int test_seq_ops( int iters );
 };
 
-
 Core_SeqBaseTest::Core_SeqBaseTest()
 {
 }
 
+Core_SeqBaseTest::~Core_SeqBaseTest()
+{
+    clear();
+}
 
 void Core_SeqBaseTest::clear()
 {
@@ -999,7 +1003,7 @@ void Core_SeqBaseTest::run( int )
             {
                 t = cvtest::randReal(rng)*(max_log_storage_block_size - min_log_storage_block_size)
                 + min_log_storage_block_size;
-                storage = cvCreateMemStorage( cvRound( exp(t * CV_LOG2) ) );
+                storage.reset(cvCreateMemStorage( cvRound( exp(t * CV_LOG2) ) ));
             }
 
             iter = struct_idx = -1;
@@ -1028,7 +1032,7 @@ void Core_SeqBaseTest::run( int )
                 cvClearMemStorage( storage );
         }
     }
-    catch(int)
+    catch(const int &)
     {
     }
 }
@@ -1083,11 +1087,11 @@ void Core_SeqSortInvTest::run( int )
         {
             struct_idx = iter = -1;
 
-            if( storage.empty() )
+            if( !storage )
             {
                 t = cvtest::randReal(rng)*(max_log_storage_block_size - min_log_storage_block_size)
                 + min_log_storage_block_size;
-                storage = cvCreateMemStorage( cvRound( exp(t * CV_LOG2) ) );
+                storage.reset(cvCreateMemStorage( cvRound( exp(t * CV_LOG2) ) ));
             }
 
             for( iter = 0; iter < iterations/10; iter++ )
@@ -1196,7 +1200,7 @@ void Core_SeqSortInvTest::run( int )
             storage.release();
         }
     }
-    catch (int)
+    catch (const int &)
     {
     }
 }
@@ -1208,6 +1212,7 @@ class Core_SetTest : public Core_DynStructBaseTest
 {
 public:
     Core_SetTest();
+    virtual ~Core_SetTest();
     void clear();
     void run( int );
 
@@ -1221,6 +1226,10 @@ Core_SetTest::Core_SetTest()
 {
 }
 
+Core_SetTest::~Core_SetTest()
+{
+    clear();
+}
 
 void Core_SetTest::clear()
 {
@@ -1357,7 +1366,7 @@ int  Core_SetTest::test_set_ops( int iters )
                                   (cvset->total == 0 || cvset->total >= prev_total),
                                   "The total number of cvset elements is not correct" );
 
-        // CvSet and simple set do not neccessary have the same "total" (active & free) number,
+        // CvSet and simple set do not necessary have the same "total" (active & free) number,
         // so pass "set->total" to skip that check
         test_seq_block_consistence( struct_idx, (CvSeq*)cvset, cvset->total );
         update_progressbar();
@@ -1384,7 +1393,7 @@ void Core_SetTest::run( int )
         {
             struct_idx = iter = -1;
             t = cvtest::randReal(rng)*(max_log_storage_block_size - min_log_storage_block_size) + min_log_storage_block_size;
-            storage = cvCreateMemStorage( cvRound( exp(t * CV_LOG2) ) );
+            storage.reset(cvCreateMemStorage( cvRound( exp(t * CV_LOG2) ) ));
 
             for( int i = 0; i < struct_count; i++ )
             {
@@ -1398,7 +1407,7 @@ void Core_SetTest::run( int )
 
                 cvTsReleaseSimpleSet( (CvTsSimpleSet**)&simple_struct[i] );
                 simple_struct[i] = cvTsCreateSimpleSet( max_struct_size, pure_elem_size );
-                 cxcore_struct[i] = cvCreateSet( 0, sizeof(CvSet), elem_size, storage );
+                cxcore_struct[i] = cvCreateSet( 0, sizeof(CvSet), elem_size, storage );
             }
 
             if( test_set_ops( iterations*100 ) < 0 )
@@ -1407,7 +1416,7 @@ void Core_SetTest::run( int )
             storage.release();
         }
     }
-    catch(int)
+    catch(const int &)
     {
     }
 }
@@ -1419,6 +1428,7 @@ class Core_GraphTest : public Core_DynStructBaseTest
 {
 public:
     Core_GraphTest();
+    virtual ~Core_GraphTest();
     void clear();
     void run( int );
 
@@ -1432,6 +1442,10 @@ Core_GraphTest::Core_GraphTest()
 {
 }
 
+Core_GraphTest::~Core_GraphTest()
+{
+    clear();
+}
 
 void Core_GraphTest::clear()
 {
@@ -1779,7 +1793,7 @@ int  Core_GraphTest::test_graph_ops( int iters )
                                   (graph->edges->total == 0 || graph->edges->total >= prev_edge_total),
                                   "The total number of graph vertices is not correct" );
 
-        // CvGraph and simple graph do not neccessary have the same "total" (active & free) number,
+        // CvGraph and simple graph do not necessary have the same "total" (active & free) number,
         // so pass "graph->total" (or "graph->edges->total") to skip that check
         test_seq_block_consistence( struct_idx, (CvSeq*)graph, graph->total );
         test_seq_block_consistence( struct_idx, (CvSeq*)graph->edges, graph->edges->total );
@@ -1811,7 +1825,7 @@ void Core_GraphTest::run( int )
             int block_size = cvRound( exp(t * CV_LOG2) );
             block_size = MAX(block_size, (int)(sizeof(CvGraph) + sizeof(CvMemBlock) + sizeof(CvSeqBlock)));
 
-            storage = cvCreateMemStorage(block_size);
+            storage.reset(cvCreateMemStorage(block_size));
 
             for( i = 0; i < struct_count; i++ )
             {
@@ -1845,7 +1859,7 @@ void Core_GraphTest::run( int )
             storage.release();
         }
     }
-    catch(int)
+    catch(const int &)
     {
     }
 }
@@ -1929,7 +1943,7 @@ void Core_GraphScanTest::run( int )
             storage_blocksize = MAX(storage_blocksize, (int)(sizeof(CvGraph) + sizeof(CvMemBlock) + sizeof(CvSeqBlock)));
             storage_blocksize = MAX(storage_blocksize, (int)(sizeof(CvGraphEdge) + sizeof(CvMemBlock) + sizeof(CvSeqBlock)));
             storage_blocksize = MAX(storage_blocksize, (int)(sizeof(CvGraphVtx) + sizeof(CvMemBlock) + sizeof(CvSeqBlock)));
-            storage = cvCreateMemStorage(storage_blocksize);
+            storage.reset(cvCreateMemStorage(storage_blocksize));
 
             if( gen == 0 )
             {
@@ -2044,6 +2058,8 @@ void Core_GraphScanTest::run( int )
                 CV_TS_SEQ_CHECK_CONDITION( vtx_count == 0 && edge_count == 0,
                                           "Not every vertex/edge has been visited" );
                 update_progressbar();
+
+                cvReleaseGraphScanner( &scanner );
             }
 
             // for a random graph the test just checks that every graph vertex and
@@ -2105,11 +2121,9 @@ void Core_GraphScanTest::run( int )
             storage.release();
         }
     }
-    catch(int)
+    catch(const int &)
     {
     }
-
-    cvReleaseGraphScanner( &scanner );
 }
 
 
@@ -2119,4 +2133,4 @@ TEST(Core_DS_Set, basic_operations) { Core_SetTest test; test.safe_run(); }
 TEST(Core_DS_Graph, basic_operations) { Core_GraphTest test; test.safe_run(); }
 TEST(Core_DS_Graph, scan) { Core_GraphScanTest test; test.safe_run(); }
 
-
+}} // namespace

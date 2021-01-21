@@ -39,15 +39,22 @@
 //
 //M*/
 #include "test_precomp.hpp"
+#include "opencv2/ts/ocl_test.hpp"
 
-using namespace cv;
-using namespace std;
+namespace opencv_test { namespace {
+
+#define OCL_TUNING_MODE 0
+#if OCL_TUNING_MODE
+#define OCL_TUNING_MODE_ONLY(code) code
+#else
+#define OCL_TUNING_MODE_ONLY(code)
+#endif
 
 // image moments
 class CV_MomentsTest : public cvtest::ArrayTest
 {
 public:
-    CV_MomentsTest();
+    CV_MomentsTest(bool try_umat);
 
 protected:
 
@@ -58,18 +65,19 @@ protected:
     void get_minmax_bounds( int i, int j, int type, Scalar& low, Scalar& high );
     double get_success_error_level( int test_case_idx, int i, int j );
     void run_func();
-    int coi;
     bool is_binary;
+    bool try_umat_;
 };
 
 
-CV_MomentsTest::CV_MomentsTest()
+CV_MomentsTest::CV_MomentsTest(bool try_umat) :
+    try_umat_(try_umat)
 {
     test_array[INPUT].push_back(NULL);
     test_array[OUTPUT].push_back(NULL);
     test_array[REF_OUTPUT].push_back(NULL);
-    coi = -1;
     is_binary = false;
+    OCL_TUNING_MODE_ONLY(test_case_count = 10);
     //element_wise_relative_error = false;
 }
 
@@ -96,30 +104,29 @@ void CV_MomentsTest::get_minmax_bounds( int i, int j, int type, Scalar& low, Sca
     }
 }
 
-
 void CV_MomentsTest::get_test_array_types_and_sizes( int test_case_idx,
                                                 vector<vector<Size> >& sizes, vector<vector<int> >& types )
 {
     RNG& rng = ts->get_rng();
     cvtest::ArrayTest::get_test_array_types_and_sizes( test_case_idx, sizes, types );
-    int cn = cvtest::randInt(rng) % 4 + 1;
     int depth = cvtest::randInt(rng) % 4;
     depth = depth == 0 ? CV_8U : depth == 1 ? CV_16U : depth == 2 ? CV_16S : CV_32F;
-    if( cn == 2 )
-        cn = 1;
-
-    types[INPUT][0] = CV_MAKETYPE(depth, cn);
-    types[OUTPUT][0] = types[REF_OUTPUT][0] = CV_64FC1;
-    sizes[OUTPUT][0] = sizes[REF_OUTPUT][0] = cvSize(MOMENT_COUNT,1);
 
     is_binary = cvtest::randInt(rng) % 2 != 0;
-    coi = 0;
+
+    OCL_TUNING_MODE_ONLY(
+    depth = CV_8U;
+    is_binary = false;
+    sizes[INPUT][0] = Size(1024,768)
+    );
+
+    types[INPUT][0] = CV_MAKETYPE(depth, 1);
+    types[OUTPUT][0] = types[REF_OUTPUT][0] = CV_64FC1;
+    sizes[OUTPUT][0] = sizes[REF_OUTPUT][0] = cvSize(MOMENT_COUNT,1);
+    if(CV_MAT_DEPTH(types[INPUT][0])>=CV_32S)
+        sizes[INPUT][0].width = MAX(sizes[INPUT][0].width, 3);
+
     cvmat_allowed = true;
-    if( cn > 1 )
-    {
-        coi = cvtest::randInt(rng) % cn;
-        cvmat_allowed = false;
-    }
 }
 
 
@@ -132,13 +139,6 @@ double CV_MomentsTest::get_success_error_level( int /*test_case_idx*/, int /*i*/
 int CV_MomentsTest::prepare_test_case( int test_case_idx )
 {
     int code = cvtest::ArrayTest::prepare_test_case( test_case_idx );
-    if( code > 0 )
-    {
-        int cn = test_mat[INPUT][0].channels();
-        if( cn > 1 )
-            cvSetImageCOI( (IplImage*)test_array[INPUT][0], coi + 1 );
-    }
-
     return code;
 }
 
@@ -147,7 +147,25 @@ void CV_MomentsTest::run_func()
 {
     CvMoments* m = (CvMoments*)test_mat[OUTPUT][0].ptr<double>();
     double* others = (double*)(m + 1);
-    cvMoments( test_array[INPUT][0], m, is_binary );
+    if (try_umat_)
+    {
+        UMat u;
+        test_mat[INPUT][0].clone().copyTo(u);
+        OCL_TUNING_MODE_ONLY(
+            static double ttime = 0;
+            static int ncalls = 0;
+            moments(u, is_binary != 0);
+            double t = (double)getTickCount());
+        Moments new_m = moments(u, is_binary != 0);
+        OCL_TUNING_MODE_ONLY(
+            ttime += (double)getTickCount() - t;
+            ncalls++;
+            printf("%g\n", ttime/ncalls/u.total()));
+        *m = cvMoments(new_m);
+    }
+    else
+        cvMoments( test_array[INPUT][0], m, is_binary );
+
     others[0] = cvGetNormalizedCentralMoment( m, 2, 0 );
     others[1] = cvGetNormalizedCentralMoment( m, 1, 1 );
     others[2] = cvGetNormalizedCentralMoment( m, 0, 2 );
@@ -161,15 +179,14 @@ void CV_MomentsTest::run_func()
 void CV_MomentsTest::prepare_to_validation( int /*test_case_idx*/ )
 {
     Mat& src = test_mat[INPUT][0];
-    CvMoments m;
+    CvMoments m = cvMoments();
     double* mdata = test_mat[REF_OUTPUT][0].ptr<double>();
     int depth = src.depth();
     int cn = src.channels();
     int i, y, x, cols = src.cols;
     double xc = 0., yc = 0.;
 
-    memset( &m, 0, sizeof(m));
-
+    int coi = 0;
     for( y = 0; y < src.rows; y++ )
     {
         double s0 = 0, s1 = 0, s2 = 0, s3 = 0;
@@ -350,15 +367,15 @@ int CV_HuMomentsTest::prepare_test_case( int test_case_idx )
 
 void CV_HuMomentsTest::run_func()
 {
-    cvGetHuMoments( (CvMoments*)test_mat[INPUT][0].data,
-                    (CvHuMoments*)test_mat[OUTPUT][0].data );
+    cvGetHuMoments( test_mat[INPUT][0].ptr<CvMoments>(),
+                    test_mat[OUTPUT][0].ptr<CvHuMoments>() );
 }
 
 
 void CV_HuMomentsTest::prepare_to_validation( int /*test_case_idx*/ )
 {
-    CvMoments* m = (CvMoments*)test_mat[INPUT][0].data;
-    CvHuMoments* hu = (CvHuMoments*)test_mat[REF_OUTPUT][0].data;
+    CvMoments* m = test_mat[INPUT][0].ptr<CvMoments>();
+    CvHuMoments* hu = test_mat[REF_OUTPUT][0].ptr<CvHuMoments>();
 
     double inv_m00 = m->inv_sqrt_m00*m->inv_sqrt_m00;
     double s2 = inv_m00*inv_m00; /* 1./(m00 ^ (2/2 + 1)) */
@@ -389,7 +406,8 @@ void CV_HuMomentsTest::prepare_to_validation( int /*test_case_idx*/ )
 }
 
 
-TEST(Imgproc_Moments, accuracy) { CV_MomentsTest test; test.safe_run(); }
+TEST(Imgproc_Moments, accuracy) { CV_MomentsTest test(false); test.safe_run(); }
+OCL_TEST(Imgproc_Moments, accuracy) { CV_MomentsTest test(true); test.safe_run(); }
 TEST(Imgproc_HuMoments, accuracy) { CV_HuMomentsTest test; test.safe_run(); }
 
 class CV_SmallContourMomentTest : public cvtest::BaseTest
@@ -421,3 +439,5 @@ protected:
 };
 
 TEST(Imgproc_ContourMoment, small) { CV_SmallContourMomentTest test; test.safe_run(); }
+
+}} // namespace

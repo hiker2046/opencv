@@ -1,4 +1,4 @@
-/* This sample demonstrates the way you can perform independed tasks
+/* This sample demonstrates the way you can perform independent tasks
    on the different GPUs */
 
 // Disable some warnings which are caused with CUDA headers
@@ -7,34 +7,31 @@
 #endif
 
 #include <iostream>
-#include "cvconfig.h"
-#include "opencv2/core/core.hpp"
-#include "opencv2/gpu/gpu.hpp"
+#include "opencv2/core.hpp"
+#include "opencv2/cudaarithm.hpp"
 
-#if !defined(HAVE_CUDA) || !defined(HAVE_TBB)
+#if !defined(HAVE_CUDA)
 
 int main()
 {
-#if !defined(HAVE_CUDA)
-    std::cout << "CUDA support is required (CMake key 'WITH_CUDA' must be true).\n";
-#endif
-
-#if !defined(HAVE_TBB)
-    std::cout << "TBB support is required (CMake key 'WITH_TBB' must be true).\n";
-#endif
-
+    std::cout << "CUDA support is required (OpenCV CMake parameter 'WITH_CUDA' must be true)." << std::endl;
     return 0;
 }
 
 #else
 
-#include "opencv2/core/internal.hpp" // For TBB wrappers
-
 using namespace std;
 using namespace cv;
-using namespace cv::gpu;
+using namespace cv::cuda;
 
-struct Worker { void operator()(int device_id) const; };
+struct Worker : public cv::ParallelLoopBody
+{
+    void operator()(const Range& r) const CV_OVERRIDE
+    {
+        for (int i = r.start; i < r.end; ++i) { this->operator()(i); }
+    }
+    void operator()(int device_id) const;
+};
 
 int main()
 {
@@ -46,12 +43,12 @@ int main()
     }
     for (int i = 0; i < num_devices; ++i)
     {
-        cv::gpu::printShortCudaDeviceInfo(i);
+        cv::cuda::printShortCudaDeviceInfo(i);
 
         DeviceInfo dev_info(i);
         if (!dev_info.isCompatible())
         {
-            std::cout << "GPU module isn't built for GPU #" << i << " ("
+            std::cout << "CUDA module isn't built for GPU #" << i << " ("
                  << dev_info.name() << ", CC " << dev_info.majorVersion()
                  << dev_info.minorVersion() << "\n";
             return -1;
@@ -59,8 +56,8 @@ int main()
     }
 
     // Execute calculation in two threads using two GPUs
-    int devices[] = {0, 1};
-    parallel_do(devices, devices + 2, Worker());
+    cv::Range devices(0, 2);
+    cv::parallel_for_(devices, Worker(), devices.size());
 
     return 0;
 }
@@ -77,15 +74,15 @@ void Worker::operator()(int device_id) const
     rng.fill(src, RNG::UNIFORM, 0, 1);
 
     // CPU works
-    transpose(src, dst);
+    cv::transpose(src, dst);
 
     // GPU works
     GpuMat d_src(src);
     GpuMat d_dst;
-    transpose(d_src, d_dst);
+    cuda::transpose(d_src, d_dst);
 
     // Check results
-    bool passed = norm(dst - Mat(d_dst), NORM_INF) < 1e-3;
+    bool passed = cv::norm(dst - Mat(d_dst), NORM_INF) < 1e-3;
     std::cout << "GPU #" << device_id << " (" << DeviceInfo().name() << "): "
         << (passed ? "passed" : "FAILED") << endl;
 

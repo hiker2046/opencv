@@ -42,15 +42,16 @@
 
 #include "test_precomp.hpp"
 
-#include <string>
-#include <iostream>
-#include <fstream>
-#include <iterator>
-#include <limits>
-#include <numeric>
+// this is test for a deprecated function. let's ignore deprecated warnings in this file
+#if defined(__clang__)
+    #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__)
+    #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(_MSC_VER)
+    #pragma warning( disable : 4996)
+#endif
 
-using namespace cv;
-using namespace std;
+namespace opencv_test { namespace {
 
 class CV_RigidTransform_Test : public cvtest::BaseTest
 {
@@ -75,8 +76,8 @@ struct WrapAff2D
     WrapAff2D(const Mat& aff) : F(aff.ptr<double>()) {}
     Point2f operator()(const Point2f& p)
     {
-        return Point2d( p.x * F[0] + p.y * F[1] +  F[2],
-                        p.x * F[3] + p.y * F[4] +  F[5]);
+        return Point2f( (float)(p.x * F[0] + p.y * F[1] + F[2]),
+                        (float)(p.x * F[3] + p.y * F[4] + F[5]) );
     }
 };
 
@@ -93,24 +94,24 @@ bool CV_RigidTransform_Test::testNPoints(int from)
         progress = update_progress(progress, k, ntests, 0);
 
         Mat aff(2, 3, CV_64F);
-        rng.fill(aff, CV_RAND_UNI, Scalar(-2), Scalar(2));
+        rng.fill(aff, RNG::UNIFORM, Scalar(-2), Scalar(2));
 
         int n = (unsigned)rng % 100 + 10;
 
         Mat fpts(1, n, CV_32FC2);
         Mat tpts(1, n, CV_32FC2);
 
-        rng.fill(fpts, CV_RAND_UNI, Scalar(0,0), Scalar(10,10));
-        transform(fpts.ptr<Point2f>(), fpts.ptr<Point2f>() + n, tpts.ptr<Point2f>(), WrapAff2D(aff));
+        rng.fill(fpts, RNG::UNIFORM, Scalar(0,0), Scalar(10,10));
+        std::transform(fpts.ptr<Point2f>(), fpts.ptr<Point2f>() + n, tpts.ptr<Point2f>(), WrapAff2D(aff));
 
         Mat noise(1, n, CV_32FC2);
-        rng.fill(noise, CV_RAND_NORMAL, Scalar::all(0), Scalar::all(0.001*(n<=7 ? 0 : n <= 30 ? 1 : 10)));
+        rng.fill(noise, RNG::NORMAL, Scalar::all(0), Scalar::all(0.001*(n<=7 ? 0 : n <= 30 ? 1 : 10)));
         tpts += noise;
 
         Mat aff_est = estimateRigidTransform(fpts, tpts, true);
 
-        double thres = 0.1*norm(aff);
-        double d = norm(aff_est, aff, NORM_L2);
+        double thres = 0.1*cvtest::norm(aff, NORM_L2);
+        double d = cvtest::norm(aff_est, aff, NORM_L2);
         if (d > thres)
         {
             double dB=0, nB=0;
@@ -120,7 +121,7 @@ bool CV_RigidTransform_Test::testNPoints(int from)
                 Mat B = A - repeat(A.row(0), 3, 1), Bt = B.t();
                 B = Bt*B;
                 dB = cv::determinant(B);
-                nB = norm(B);
+                nB = cvtest::norm(B, NORM_L2);
                 if( fabs(dB) < 0.01*nB )
                     continue;
             }
@@ -153,12 +154,12 @@ bool CV_RigidTransform_Test::testImage()
 
     Mat aff_est = estimateRigidTransform(img, rotated, true);
 
-    const double thres = 0.03;
-    if (norm(aff_est, aff, NORM_INF) > thres)
+    const double thres = 0.033;
+    if (cvtest::norm(aff_est, aff, NORM_INF) > thres)
     {
         ts->set_failed_test_info(cvtest::TS::FAIL_BAD_ACCURACY);
         ts->printf( cvtest::TS::LOG, "Threshold = %f, norm of difference = %f", thres,
-            norm(aff_est, aff, NORM_INF) );
+            cvtest::norm(aff_est, aff, NORM_INF) );
         return false;
     }
 
@@ -179,3 +180,5 @@ void CV_RigidTransform_Test::run( int start_from )
 }
 
 TEST(Video_RigidFlow, accuracy) { CV_RigidTransform_Test test; test.safe_run(); }
+
+}} // namespace

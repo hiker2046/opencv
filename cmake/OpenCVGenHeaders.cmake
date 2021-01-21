@@ -1,15 +1,11 @@
-# ----------------------------------------------------------------------------
-#  Variables for cvconfig.h.cmake
-# ----------------------------------------------------------------------------
-set(PACKAGE "opencv")
-set(PACKAGE_BUGREPORT "opencvlibrary-devel@lists.sourceforge.net")
-set(PACKAGE_NAME "opencv")
-set(PACKAGE_STRING "${PACKAGE} ${OPENCV_VERSION}")
-set(PACKAGE_TARNAME "${PACKAGE}")
-set(PACKAGE_VERSION "${OPENCV_VERSION}")
+# platform-specific config file
+configure_file("${OpenCV_SOURCE_DIR}/cmake/templates/cvconfig.h.in" "${OPENCV_CONFIG_FILE_INCLUDE_DIR}/cvconfig.h")
+configure_file("${OpenCV_SOURCE_DIR}/cmake/templates/cvconfig.h.in" "${OPENCV_CONFIG_FILE_INCLUDE_DIR}/opencv2/cvconfig.h")
+install(FILES "${OPENCV_CONFIG_FILE_INCLUDE_DIR}/cvconfig.h" DESTINATION ${OPENCV_INCLUDE_INSTALL_PATH}/opencv2 COMPONENT dev)
 
 # platform-specific config file
-configure_file("${OpenCV_SOURCE_DIR}/cmake/templates/cvconfig.h.cmake" "${OPENCV_CONFIG_FILE_INCLUDE_DIR}/cvconfig.h")
+ocv_compiler_optimization_fill_cpu_config()
+configure_file("${OpenCV_SOURCE_DIR}/cmake/templates/cv_cpu_config.h.in" "${OPENCV_CONFIG_FILE_INCLUDE_DIR}/cv_cpu_config.h")
 
 # ----------------------------------------------------------------------------
 #  opencv_modules.hpp based on actual modules list
@@ -33,4 +29,4 @@ set(OPENCV_MODULE_DEFINITIONS_CONFIGMAKE "${OPENCV_MODULE_DEFINITIONS_CONFIGMAKE
 #endforeach()
 
 configure_file("${OpenCV_SOURCE_DIR}/cmake/templates/opencv_modules.hpp.in" "${OPENCV_CONFIG_FILE_INCLUDE_DIR}/opencv2/opencv_modules.hpp")
-install(FILES "${OPENCV_CONFIG_FILE_INCLUDE_DIR}/opencv2/opencv_modules.hpp" DESTINATION ${OPENCV_INCLUDE_INSTALL_PATH}/opencv2 COMPONENT main)
+install(FILES "${OPENCV_CONFIG_FILE_INCLUDE_DIR}/opencv2/opencv_modules.hpp" DESTINATION ${OPENCV_INCLUDE_INSTALL_PATH}/opencv2 COMPONENT dev)

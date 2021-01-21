@@ -48,18 +48,6 @@
 
 #include "precomp.hpp"
 
-#if defined WIN32 || defined WINCE
-    #include <windows.h>
-    #undef small
-    #undef min
-    #undef max
-    #undef abs
-#endif
-
-#if defined __SSE2__ || (defined _M_IX86_FP && 2 == _M_IX86_FP)
-    #include "emmintrin.h"
-#endif
-
 namespace cv
 {
 
@@ -148,59 +136,26 @@ template<typename T> static void
 randi_( T* arr, int len, uint64* state, const DivStruct* p )
 {
     uint64 temp = *state;
-    int i = 0;
-    unsigned t0, t1, v0, v1;
-
-    for( i = 0; i <= len - 4; i += 4 )
+    for( int i = 0; i < len; i++ )
     {
         temp = RNG_NEXT(temp);
-        t0 = (unsigned)temp;
-        temp = RNG_NEXT(temp);
-        t1 = (unsigned)temp;
-        v0 = (unsigned)(((uint64)t0 * p[i].M) >> 32);
-        v1 = (unsigned)(((uint64)t1 * p[i+1].M) >> 32);
-        v0 = (v0 + ((t0 - v0) >> p[i].sh1)) >> p[i].sh2;
-        v1 = (v1 + ((t1 - v1) >> p[i+1].sh1)) >> p[i+1].sh2;
-        v0 = t0 - v0*p[i].d + p[i].delta;
-        v1 = t1 - v1*p[i+1].d + p[i+1].delta;
-        arr[i] = saturate_cast<T>((int)v0);
-        arr[i+1] = saturate_cast<T>((int)v1);
-
-        temp = RNG_NEXT(temp);
-        t0 = (unsigned)temp;
-        temp = RNG_NEXT(temp);
-        t1 = (unsigned)temp;
-        v0 = (unsigned)(((uint64)t0 * p[i+2].M) >> 32);
-        v1 = (unsigned)(((uint64)t1 * p[i+3].M) >> 32);
-        v0 = (v0 + ((t0 - v0) >> p[i+2].sh1)) >> p[i+2].sh2;
-        v1 = (v1 + ((t1 - v1) >> p[i+3].sh1)) >> p[i+3].sh2;
-        v0 = t0 - v0*p[i+2].d + p[i+2].delta;
-        v1 = t1 - v1*p[i+3].d + p[i+3].delta;
-        arr[i+2] = saturate_cast<T>((int)v0);
-        arr[i+3] = saturate_cast<T>((int)v1);
+        unsigned t = (unsigned)temp;
+        unsigned v = (unsigned)(((uint64)t * p[i].M) >> 32);
+        v = (v + ((t - v) >> p[i].sh1)) >> p[i].sh2;
+        v = t - v*p[i].d + p[i].delta;
+        arr[i] = saturate_cast<T>((int)v);
     }
-
-    for( ; i < len; i++ )
-    {
-        temp = RNG_NEXT(temp);
-        t0 = (unsigned)temp;
-        v0 = (unsigned)(((uint64)t0 * p[i].M) >> 32);
-        v0 = (v0 + ((t0 - v0) >> p[i].sh1)) >> p[i].sh2;
-        v0 = t0 - v0*p[i].d + p[i].delta;
-        arr[i] = saturate_cast<T>((int)v0);
-    }
-
     *state = temp;
 }
 
 
 #define DEF_RANDI_FUNC(suffix, type) \
 static void randBits_##suffix(type* arr, int len, uint64* state, \
-                              const Vec2i* p, bool small_flag) \
+                              const Vec2i* p, void*, bool small_flag) \
 { randBits_(arr, len, state, p, small_flag); } \
 \
 static void randi_##suffix(type* arr, int len, uint64* state, \
-                           const DivStruct* p, bool ) \
+                           const DivStruct* p, void*, bool ) \
 { randi_(arr, len, state, p); }
 
 DEF_RANDI_FUNC(8u, uchar)
@@ -209,105 +164,62 @@ DEF_RANDI_FUNC(16u, ushort)
 DEF_RANDI_FUNC(16s, short)
 DEF_RANDI_FUNC(32s, int)
 
-static void randf_32f( float* arr, int len, uint64* state, const Vec2f* p, bool )
+static void randf_32f( float* arr, int len, uint64* state, const Vec2f* p, void*, bool )
 {
     uint64 temp = *state;
-    int i = 0;
-
-    for( ; i <= len - 4; i += 4 )
+    for( int i = 0; i < len; i++ )
     {
-        float f[4];
-        f[0] = (float)(int)(temp = RNG_NEXT(temp));
-        f[1] = (float)(int)(temp = RNG_NEXT(temp));
-        f[2] = (float)(int)(temp = RNG_NEXT(temp));
-        f[3] = (float)(int)(temp = RNG_NEXT(temp));
-
-        // handwritten SSE is required not for performance but for numerical stability!
-        // both 32-bit gcc and MSVC compilers trend to generate double precision SSE
-        // while 64-bit compilers generate single precision SIMD instructions
-        // so manual vectorisation forces all compilers to the single precision
-#if defined __SSE2__ || (defined _M_IX86_FP && 2 == _M_IX86_FP)
-        __m128 q0 = _mm_loadu_ps((const float*)(p + i));
-        __m128 q1 = _mm_loadu_ps((const float*)(p + i + 2));
-
-        __m128 q01l = _mm_unpacklo_ps(q0, q1);
-        __m128 q01h = _mm_unpackhi_ps(q0, q1);
-
-        __m128 p0 = _mm_unpacklo_ps(q01l, q01h);
-        __m128 p1 = _mm_unpackhi_ps(q01l, q01h);
-
-        _mm_storeu_ps(arr + i, _mm_add_ps(_mm_mul_ps(_mm_loadu_ps(f), p0), p1));
-#else
-        arr[i+0] = f[0]*p[i+0][0] + p[i+0][1];
-        arr[i+1] = f[1]*p[i+1][0] + p[i+1][1];
-        arr[i+2] = f[2]*p[i+2][0] + p[i+2][1];
-        arr[i+3] = f[3]*p[i+3][0] + p[i+3][1];
-#endif
+        int t = (int)(temp = RNG_NEXT(temp));
+        arr[i] = (float)(t*p[i][0]);
     }
-
-    for( ; i < len; i++ )
-    {
-        temp = RNG_NEXT(temp);
-#if defined __SSE2__ || (defined _M_IX86_FP && 2 == _M_IX86_FP)
-        _mm_store_ss(arr + i, _mm_add_ss(
-                _mm_mul_ss(_mm_set_ss((float)(int)temp), _mm_set_ss(p[i][0])),
-                _mm_set_ss(p[i][1]))
-                );
-#else
-        arr[i] = (int)temp*p[i][0] + p[i][1];
-#endif
-    }
-
     *state = temp;
-}
 
+    // add bias separately to make the generated random numbers
+    // more deterministic, independent of
+    // architecture details (FMA instruction use etc.)
+    hal::addRNGBias32f(arr, &p[0][0], len);
+}
 
 static void
-randf_64f( double* arr, int len, uint64* state, const Vec2d* p, bool )
+randf_64f( double* arr, int len, uint64* state, const Vec2d* p, void*, bool )
 {
     uint64 temp = *state;
-    int64 v = 0;
-    int i;
-
-    for( i = 0; i <= len - 4; i += 4 )
-    {
-        double f0, f1;
-
-        temp = RNG_NEXT(temp);
-        v = (temp >> 32)|(temp << 32);
-        f0 = v*p[i][0] + p[i][1];
-        temp = RNG_NEXT(temp);
-        v = (temp >> 32)|(temp << 32);
-        f1 = v*p[i+1][0] + p[i+1][1];
-        arr[i] = f0; arr[i+1] = f1;
-
-        temp = RNG_NEXT(temp);
-        v = (temp >> 32)|(temp << 32);
-        f0 = v*p[i+2][0] + p[i+2][1];
-        temp = RNG_NEXT(temp);
-        v = (temp >> 32)|(temp << 32);
-        f1 = v*p[i+3][0] + p[i+3][1];
-        arr[i+2] = f0; arr[i+3] = f1;
-    }
-
-    for( ; i < len; i++ )
+    for( int i = 0; i < len; i++ )
     {
         temp = RNG_NEXT(temp);
-        v = (temp >> 32)|(temp << 32);
-        arr[i] = v*p[i][0] + p[i][1];
+        int64 v = (temp >> 32)|(temp << 32);
+        arr[i] = v*p[i][0];
     }
-
     *state = temp;
+
+    hal::addRNGBias64f(arr, &p[0][0], len);
 }
 
-typedef void (*RandFunc)(uchar* arr, int len, uint64* state, const void* p, bool small_flag);
+static void randf_16f( float16_t* arr, int len, uint64* state, const Vec2f* p, float* fbuf, bool )
+{
+    uint64 temp = *state;
+    for( int i = 0; i < len; i++ )
+    {
+        float f = (float)(int)(temp = RNG_NEXT(temp));
+        fbuf[i] = f*p[i][0];
+    }
+    *state = temp;
+
+    // add bias separately to make the generated random numbers
+    // more deterministic, independent of
+    // architecture details (FMA instruction use etc.)
+    hal::addRNGBias32f(fbuf, &p[0][0], len);
+    hal::cvt32f16f(fbuf, arr, len);
+}
+
+typedef void (*RandFunc)(uchar* arr, int len, uint64* state, const void* p, void* tempbuf, bool small_flag);
 
 
 static RandFunc randTab[][8] =
 {
     {
         (RandFunc)randi_8u, (RandFunc)randi_8s, (RandFunc)randi_16u, (RandFunc)randi_16s,
-        (RandFunc)randi_32s, (RandFunc)randf_32f, (RandFunc)randf_64f, 0
+        (RandFunc)randi_32s, (RandFunc)randf_32f, (RandFunc)randf_64f, (RandFunc)randf_16f
     },
     {
         (RandFunc)randBits_8u, (RandFunc)randBits_8s, (RandFunc)randBits_16u, (RandFunc)randBits_16s,
@@ -318,7 +230,7 @@ static RandFunc randTab[][8] =
 /*
    The code below implements the algorithm described in
    "The Ziggurat Method for Generating Random Variables"
-   by Marsaglia and Tsang, Journal of Statistical Software.
+   by George Marsaglia and Wai Wan Tsang, Journal of Statistical Software, 2007.
 */
 static void
 randn_0_1_32f( float* arr, int len, uint64* state )
@@ -479,10 +391,14 @@ static RandnScaleFunc randnScaleTab[] =
 void RNG::fill( InputOutputArray _mat, int disttype,
                 InputArray _param1arg, InputArray _param2arg, bool saturateRange )
 {
+    CV_Assert(!_mat.empty());
+
     Mat mat = _mat.getMat(), _param1 = _param1arg.getMat(), _param2 = _param2arg.getMat();
     int depth = mat.depth(), cn = mat.channels();
     AutoBuffer<double> _parambuf;
-    int j, k, fast_int_mode = 0, smallFlag = 1;
+    int j, k;
+    bool fast_int_mode = false;
+    bool smallFlag = true;
     RandFunc func = 0;
     RandnScaleFunc scaleFunc = 0;
 
@@ -508,9 +424,9 @@ void RNG::fill( InputOutputArray _mat, int disttype,
     if( disttype == UNIFORM )
     {
         _parambuf.allocate(cn*8 + n1 + n2);
-        double* parambuf = _parambuf;
-        double* p1 = (double*)_param1.data;
-        double* p2 = (double*)_param2.data;
+        double* parambuf = _parambuf.data();
+        double* p1 = _param1.ptr<double>();
+        double* p2 = _param2.ptr<double>();
 
         if( !_param1.isContinuous() || _param1.type() != CV_64F || n1 != cn )
         {
@@ -535,24 +451,29 @@ void RNG::fill( InputOutputArray _mat, int disttype,
         if( depth <= CV_32S )
         {
             ip = (Vec2i*)(parambuf + cn*2);
-            for( j = 0, fast_int_mode = 1; j < cn; j++ )
+            for( j = 0, fast_int_mode = true; j < cn; j++ )
             {
-                double a = min(p1[j], p2[j]);
-                double b = max(p1[j], p2[j]);
+                double a = std::min(p1[j], p2[j]);
+                double b = std::max(p1[j], p2[j]);
                 if( saturateRange )
                 {
-                    a = max(a, depth == CV_8U || depth == CV_16U ? 0. :
+                    a = std::max(a, depth == CV_8U || depth == CV_16U ? 0. :
                             depth == CV_8S ? -128. : depth == CV_16S ? -32768. : (double)INT_MIN);
-                    b = min(b, depth == CV_8U ? 256. : depth == CV_16U ? 65536. :
+                    b = std::min(b, depth == CV_8U ? 256. : depth == CV_16U ? 65536. :
                             depth == CV_8S ? 128. : depth == CV_16S ? 32768. : (double)INT_MAX);
                 }
                 ip[j][1] = cvCeil(a);
                 int idiff = ip[j][0] = cvFloor(b) - ip[j][1] - 1;
+                if (idiff < 0)
+                {
+                    idiff = 0;
+                    ip[j][0] = 0;
+                }
                 double diff = b - a;
 
-                fast_int_mode &= diff <= 4294967296. && (idiff & (idiff+1)) == 0;
+                fast_int_mode = fast_int_mode && diff <= 4294967296. && (idiff & (idiff+1)) == 0;
                 if( fast_int_mode )
-                    smallFlag &= idiff <= 255;
+                    smallFlag = smallFlag && (idiff <= 255);
                 else
                 {
                     if( diff > INT_MAX )
@@ -573,12 +494,12 @@ void RNG::fill( InputOutputArray _mat, int disttype,
                     while(((uint64)1 << l) < d)
                         l++;
                     ds[j].M = (unsigned)(((uint64)1 << 32)*(((uint64)1 << l) - d)/d) + 1;
-                    ds[j].sh1 = min(l, 1);
-                    ds[j].sh2 = max(l - 1, 0);
+                    ds[j].sh1 = std::min(l, 1);
+                    ds[j].sh2 = std::max(l - 1, 0);
                 }
             }
 
-            func = randTab[fast_int_mode][depth];
+            func = randTab[fast_int_mode ? 1 : 0][depth];
         }
         else
         {
@@ -590,8 +511,8 @@ void RNG::fill( InputOutputArray _mat, int disttype,
             // for each channel i compute such dparam[0][i] & dparam[1][i],
             // so that a signed 32/64-bit integer X is transformed to
             // the range [param1.val[i], param2.val[i]) using
-            // dparam[1][i]*X + dparam[0][i]
-            if( depth == CV_32F )
+            // dparam[0][i]*X + dparam[1][i]
+            if( depth != CV_64F )
             {
                 fp = (Vec2f*)(parambuf + cn*2);
                 for( j = 0; j < cn; j++ )
@@ -617,13 +538,13 @@ void RNG::fill( InputOutputArray _mat, int disttype,
     else if( disttype == CV_RAND_NORMAL )
     {
         _parambuf.allocate(MAX(n1, cn) + MAX(n2, cn));
-        double* parambuf = _parambuf;
+        double* parambuf = _parambuf.data();
 
         int ptype = depth == CV_64F ? CV_64F : CV_32F;
         int esz = (int)CV_ELEM_SIZE(ptype);
 
-        if( _param1.isContinuous() && _param1.type() == ptype )
-            mean = _param1.data;
+        if( _param1.isContinuous() && _param1.type() == ptype && n1 >= cn)
+            mean = _param1.ptr();
         else
         {
             Mat tmp(_param1.size(), ptype, parambuf);
@@ -635,18 +556,18 @@ void RNG::fill( InputOutputArray _mat, int disttype,
             for( j = n1*esz; j < cn*esz; j++ )
                 mean[j] = mean[j - n1*esz];
 
-        if( _param2.isContinuous() && _param2.type() == ptype )
-            stddev = _param2.data;
+        if( _param2.isContinuous() && _param2.type() == ptype && n2 >= cn)
+            stddev = _param2.ptr();
         else
         {
-            Mat tmp(_param2.size(), ptype, parambuf + cn);
+            Mat tmp(_param2.size(), ptype, parambuf + MAX(n1, cn));
             _param2.convertTo(tmp, ptype);
-            stddev = (uchar*)(parambuf + cn);
+            stddev = (uchar*)(parambuf + MAX(n1, cn));
         }
 
-        if( n1 < cn )
-            for( j = n1*esz; j < cn*esz; j++ )
-                stddev[j] = stddev[j - n1*esz];
+        if( n2 < cn )
+            for( j = n2*esz; j < cn*esz; j++ )
+                stddev[j] = stddev[j - n2*esz];
 
         stdmtx = _param2.rows == cn && _param2.cols == cn;
         scaleFunc = randnScaleTab[depth];
@@ -657,21 +578,22 @@ void RNG::fill( InputOutputArray _mat, int disttype,
 
     const Mat* arrays[] = {&mat, 0};
     uchar* ptr;
-    NAryMatIterator it(arrays, &ptr);
+    NAryMatIterator it(arrays, &ptr, 1);
     int total = (int)it.size, blockSize = std::min((BLOCK_SIZE + cn - 1)/cn, total);
     size_t esz = mat.elemSize();
     AutoBuffer<double> buf;
     uchar* param = 0;
     float* nbuf = 0;
+    float* tmpbuf = 0;
 
     if( disttype == UNIFORM )
     {
         buf.allocate(blockSize*cn*4);
-        param = (uchar*)(double*)buf;
+        param = (uchar*)(double*)buf.data();
 
-        if( ip )
+        if( depth <= CV_32S )
         {
-            if( ds )
+            if( !fast_int_mode )
             {
                 DivStruct* p = (DivStruct*)param;
                 for( j = 0; j < blockSize*cn; j += cn )
@@ -686,12 +608,14 @@ void RNG::fill( InputOutputArray _mat, int disttype,
                         p[j + k] = ip[k];
             }
         }
-        else if( fp )
+        else if( depth != CV_64F )
         {
             Vec2f* p = (Vec2f*)param;
             for( j = 0; j < blockSize*cn; j += cn )
                 for( k = 0; k < cn; k++ )
                     p[j + k] = fp[k];
+            if( depth == CV_16F )
+                tmpbuf = (float*)p + blockSize*cn*2;
         }
         else
         {
@@ -704,7 +628,7 @@ void RNG::fill( InputOutputArray _mat, int disttype,
     else
     {
         buf.allocate((blockSize*cn+1)/2);
-        nbuf = (float*)(double*)buf;
+        nbuf = (float*)(double*)buf.data();
     }
 
     for( size_t i = 0; i < it.nplanes; i++, ++it )
@@ -714,7 +638,7 @@ void RNG::fill( InputOutputArray _mat, int disttype,
             int len = std::min(total - j, blockSize);
 
             if( disttype == CV_RAND_UNI )
-                func( ptr, len*cn, &state, param, smallFlag != 0 );
+                func( ptr, len*cn, &state, param, tmpbuf, smallFlag );
             else
             {
                 randn_0_1_32f(nbuf, len*cn, &state);
@@ -725,73 +649,30 @@ void RNG::fill( InputOutputArray _mat, int disttype,
     }
 }
 
-#ifdef WIN32
-#ifdef WINCE
-#	define TLS_OUT_OF_INDEXES ((DWORD)0xFFFFFFFF)
-#endif
-static DWORD tlsRNGKey = TLS_OUT_OF_INDEXES;
+}
 
-void deleteThreadRNGData()
+cv::RNG& cv::theRNG()
 {
-    if( tlsRNGKey != TLS_OUT_OF_INDEXES )
-        delete (RNG*)TlsGetValue( tlsRNGKey );
+    return getCoreTlsData().rng;
 }
 
-RNG& theRNG()
+void cv::setRNGSeed(int seed)
 {
-    if( tlsRNGKey == TLS_OUT_OF_INDEXES )
-    {
-        tlsRNGKey = TlsAlloc();
-        CV_Assert(tlsRNGKey != TLS_OUT_OF_INDEXES);
-    }
-    RNG* rng = (RNG*)TlsGetValue( tlsRNGKey );
-    if( !rng )
-    {
-        rng = new RNG;
-        TlsSetValue( tlsRNGKey, rng );
-    }
-    return *rng;
+    theRNG() = RNG(static_cast<uint64>(seed));
 }
 
-#else
-
-static pthread_key_t tlsRNGKey = 0;
-static pthread_once_t tlsRNGKeyOnce = PTHREAD_ONCE_INIT;
-
-static void deleteRNG(void* data)
-{
-    delete (RNG*)data;
-}
-
-static void makeRNGKey()
-{
-    int errcode = pthread_key_create(&tlsRNGKey, deleteRNG);
-    CV_Assert(errcode == 0);
-}
-
-RNG& theRNG()
-{
-    pthread_once(&tlsRNGKeyOnce, makeRNGKey);
-    RNG* rng = (RNG*)pthread_getspecific(tlsRNGKey);
-    if( !rng )
-    {
-        rng = new RNG;
-        pthread_setspecific(tlsRNGKey, rng);
-    }
-    return *rng;
-}
-
-#endif
-
-}
 
 void cv::randu(InputOutputArray dst, InputArray low, InputArray high)
 {
+    CV_INSTRUMENT_REGION();
+
     theRNG().fill(dst, RNG::UNIFORM, low, high);
 }
 
 void cv::randn(InputOutputArray dst, InputArray mean, InputArray stddev)
 {
+    CV_INSTRUMENT_REGION();
+
     theRNG().fill(dst, RNG::NORMAL, mean, stddev);
 }
 
@@ -799,29 +680,35 @@ namespace cv
 {
 
 template<typename T> static void
-randShuffle_( Mat& _arr, RNG& rng, double iterFactor )
+randShuffle_( Mat& _arr, RNG& rng, double )
 {
-    int sz = _arr.rows*_arr.cols, iters = cvRound(iterFactor*sz);
+    unsigned sz = (unsigned)_arr.total();
     if( _arr.isContinuous() )
     {
-        T* arr = (T*)_arr.data;
-        for( int i = 0; i < iters; i++ )
+        T* arr = _arr.ptr<T>();
+        for( unsigned i = 0; i < sz; i++ )
         {
-            int j = (unsigned)rng % sz, k = (unsigned)rng % sz;
-            std::swap( arr[j], arr[k] );
+            unsigned j = (unsigned)rng % sz;
+            std::swap( arr[j], arr[i] );
         }
     }
     else
     {
-        uchar* data = _arr.data;
+        CV_Assert( _arr.dims <= 2 );
+        uchar* data = _arr.ptr();
         size_t step = _arr.step;
+        int rows = _arr.rows;
         int cols = _arr.cols;
-        for( int i = 0; i < iters; i++ )
+        for( int i0 = 0; i0 < rows; i0++ )
         {
-            int j1 = (unsigned)rng % sz, k1 = (unsigned)rng % sz;
-            int j0 = j1/cols, k0 = k1/cols;
-            j1 -= j0*cols; k1 -= k0*cols;
-            std::swap( ((T*)(data + step*j0))[j1], ((T*)(data + step*k0))[k1] );
+            T* p = _arr.ptr<T>(i0);
+            for( int j0 = 0; j0 < cols; j0++ )
+            {
+                unsigned k1 = (unsigned)rng % sz;
+                int i1 = (int)(k1 / cols);
+                int j1 = (int)(k1 - (unsigned)i1*(unsigned)cols);
+                std::swap( p[j0], ((T*)(data + step*i1))[j1] );
+            }
         }
     }
 }
@@ -832,6 +719,8 @@ typedef void (*RandShuffleFunc)( Mat& dst, RNG& rng, double iterFactor );
 
 void cv::randShuffle( InputOutputArray _dst, double iterFactor, RNG* _rng )
 {
+    CV_INSTRUMENT_REGION();
+
     RandShuffleFunc tab[] =
     {
         0,
@@ -861,11 +750,6 @@ void cv::randShuffle( InputOutputArray _dst, double iterFactor, RNG* _rng )
     func( dst, rng, iterFactor );
 }
 
-void cv::randShuffle_( InputOutputArray _dst, double iterFactor )
-{
-    randShuffle(_dst, iterFactor);
-}
-
 CV_IMPL void
 cvRandArr( CvRNG* _rng, CvArr* arr, int disttype, CvScalar param1, CvScalar param2 )
 {
@@ -882,5 +766,130 @@ CV_IMPL void cvRandShuffle( CvArr* arr, CvRNG* _rng, double iter_factor )
     cv::RNG& rng = _rng ? (cv::RNG&)*_rng : cv::theRNG();
     cv::randShuffle( dst, iter_factor, &rng );
 }
+
+// Mersenne Twister random number generator.
+// Inspired by http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/MT2002/CODES/mt19937ar.c
+
+/*
+   A C-program for MT19937, with initialization improved 2002/1/26.
+   Coded by Takuji Nishimura and Makoto Matsumoto.
+
+   Before using, initialize the state by using init_genrand(seed)
+   or init_by_array(init_key, key_length).
+
+   Copyright (C) 1997 - 2002, Makoto Matsumoto and Takuji Nishimura,
+   All rights reserved.
+
+   Redistribution and use in source and binary forms, with or without
+   modification, are permitted provided that the following conditions
+   are met:
+
+     1. Redistributions of source code must retain the above copyright
+        notice, this list of conditions and the following disclaimer.
+
+     2. Redistributions in binary form must reproduce the above copyright
+        notice, this list of conditions and the following disclaimer in the
+        documentation and/or other materials provided with the distribution.
+
+     3. The names of its contributors may not be used to endorse or promote
+        products derived from this software without specific prior written
+        permission.
+
+   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+   "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+   A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+   CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+   EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+   PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+   PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+   LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+   NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+   SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+   Any feedback is very welcome.
+   http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/emt.html
+   email: m-mat @ math.sci.hiroshima-u.ac.jp (remove space)
+*/
+
+cv::RNG_MT19937::RNG_MT19937(unsigned s) { seed(s); }
+
+cv::RNG_MT19937::RNG_MT19937() { seed(5489U); }
+
+void cv::RNG_MT19937::seed(unsigned s)
+{
+    state[0]= s;
+    for (mti = 1; mti < N; mti++)
+    {
+        /* See Knuth TAOCP Vol2. 3rd Ed. P.106 for multiplier. */
+        state[mti] = (1812433253U * (state[mti - 1] ^ (state[mti - 1] >> 30)) + mti);
+    }
+}
+
+unsigned cv::RNG_MT19937::next()
+{
+    /* mag01[x] = x * MATRIX_A  for x=0,1 */
+    static unsigned mag01[2] = { 0x0U, /*MATRIX_A*/ 0x9908b0dfU};
+
+    const unsigned UPPER_MASK = 0x80000000U;
+    const unsigned LOWER_MASK = 0x7fffffffU;
+
+    /* generate N words at one time */
+    if (mti >= N)
+    {
+        int kk = 0;
+
+        for (; kk < N - M; ++kk)
+        {
+            unsigned y = (state[kk] & UPPER_MASK) | (state[kk + 1] & LOWER_MASK);
+            state[kk] = state[kk + M] ^ (y >> 1) ^ mag01[y & 0x1U];
+        }
+
+        for (; kk < N - 1; ++kk)
+        {
+            unsigned y = (state[kk] & UPPER_MASK) | (state[kk + 1] & LOWER_MASK);
+            state[kk] = state[kk + (M - N)] ^ (y >> 1) ^ mag01[y & 0x1U];
+        }
+
+        unsigned y = (state[N - 1] & UPPER_MASK) | (state[0] & LOWER_MASK);
+        state[N - 1] = state[M - 1] ^ (y >> 1) ^ mag01[y & 0x1U];
+
+        mti = 0;
+    }
+
+    unsigned y = state[mti++];
+
+    /* Tempering */
+    y ^= (y >> 11);
+    y ^= (y <<  7) & 0x9d2c5680U;
+    y ^= (y << 15) & 0xefc60000U;
+    y ^= (y >> 18);
+
+    return y;
+}
+
+cv::RNG_MT19937::operator unsigned() { return next(); }
+
+cv::RNG_MT19937::operator int() { return (int)next();}
+
+cv::RNG_MT19937::operator float() { return next() * (1.f / 4294967296.f); }
+
+cv::RNG_MT19937::operator double()
+{
+    unsigned a = next() >> 5;
+    unsigned b = next() >> 6;
+    return (a * 67108864.0 + b) * (1.0 / 9007199254740992.0);
+}
+
+int cv::RNG_MT19937::uniform(int a, int b) { return (int)(next() % (b - a) + a); }
+
+float cv::RNG_MT19937::uniform(float a, float b) { return ((float)*this)*(b - a) + a; }
+
+double cv::RNG_MT19937::uniform(double a, double b) { return ((double)*this)*(b - a) + a; }
+
+unsigned cv::RNG_MT19937::operator ()(unsigned b) { return next() % b; }
+
+unsigned cv::RNG_MT19937::operator ()() { return next(); }
 
 /* End of file. */

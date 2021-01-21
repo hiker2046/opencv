@@ -1,162 +1,191 @@
-#! /usr/bin/env python
-from random import Random
-import colorsys
+#!/usr/bin/env python
+'''
+    This program demonstrates OpenCV drawing and text output functions by drawing different shapes and text strings
+    Usage :
+        python3 drawing.py
+    Press any button to exit
+    '''
 
-print "OpenCV Python version of drawing"
+# Python 2/3 compatibility
+from __future__ import print_function
 
-import cv2.cv as cv
+import numpy as np
+import cv2 as cv
 
-def random_color(random):
-    """
-    Return a random color
-    """
-    icolor = random.randint(0, 0xFFFFFF)
-    return cv.Scalar(icolor & 0xff, (icolor >> 8) & 0xff, (icolor >> 16) & 0xff)
+# Drawing Lines
+def lines():
+    for i in range(NUMBER*2):
+        pt1, pt2 = [], []
+        pt1.append(np.random.randint(x1, x2))
+        pt1.append(np.random.randint(y1, y2))
+        pt2.append(np.random.randint(x1, x2))
+        pt2.append(np.random.randint(y1, y2))
+        color = "%06x" % np.random.randint(0, 0xFFFFFF)
+        color = tuple(int(color[i:i+2], 16) for i in (0, 2 ,4))
+        arrowed =  np.random.randint(0, 6)
+        if (arrowed<3):
+            cv.line(image, tuple(pt1), tuple(pt2), color, np.random.randint(1, 10), lineType)
+        else:
+            cv.arrowedLine(image, tuple(pt1), tuple(pt2), color, np.random.randint(1, 10), lineType)
+        cv.imshow(wndname, image)
+        if cv.waitKey(DELAY)>=0:
+            return
+
+# Drawing Rectangle
+def rectangle():
+    for i in range(NUMBER*2):
+        pt1, pt2 = [], []
+        pt1.append(np.random.randint(x1, x2))
+        pt1.append(np.random.randint(y1, y2))
+        pt2.append(np.random.randint(x1, x2))
+        pt2.append(np.random.randint(y1, y2))
+        color = "%06x" % np.random.randint(0, 0xFFFFFF)
+        color = tuple(int(color[i:i+2], 16) for i in (0, 2 ,4))
+        thickness = np.random.randint(-3, 10)
+        marker = np.random.randint(0, 10)
+        marker_size = np.random.randint(30, 80)
+
+        if (marker > 5):
+            cv.rectangle(image, tuple(pt1), tuple(pt2), color, max(thickness, -1), lineType)
+        else:
+            cv.drawMarker(image, tuple(pt1), color, marker, marker_size)
+        cv.imshow(wndname, image)
+        if cv.waitKey(DELAY)>=0:
+            return
+
+# Drawing ellipse
+def ellipse():
+    for i in range(NUMBER*2):
+        center = []
+        center.append(np.random.randint(x1, x2))
+        center.append(np.random.randint(x1, x2))
+        axes = []
+        axes.append(np.random.randint(0, 200))
+        axes.append(np.random.randint(0, 200))
+        angle = np.random.randint(0, 180)
+        color = "%06x" % np.random.randint(0, 0xFFFFFF)
+        color = tuple(int(color[i:i+2], 16) for i in (0, 2 ,4))
+        thickness = np.random.randint(-1, 9)
+        cv.ellipse(image, tuple(center), tuple(axes), angle, angle-100, angle + 200, color, thickness, lineType)
+        cv.imshow(wndname, image)
+        if cv.waitKey(DELAY)>=0:
+            return
+
+# Drawing Polygonal Curves
+def polygonal():
+    for i in range(NUMBER):
+        pt = [(0, 0)]*6
+        pt = np.resize(pt, (2, 3, 2))
+        pt[0][0][0] = np.random.randint(x1, x2)
+        pt[0][0][1] = np.random.randint(y1, y2)
+        pt[0][1][0] = np.random.randint(x1, x2)
+        pt[0][1][1] = np.random.randint(y1, y2)
+        pt[0][2][0] = np.random.randint(x1, x2)
+        pt[0][2][1] = np.random.randint(y1, y2)
+        pt[1][0][0] = np.random.randint(x1, x2)
+        pt[1][0][1] = np.random.randint(y1, y2)
+        pt[1][1][0] = np.random.randint(x1, x2)
+        pt[1][1][1] = np.random.randint(y1, y2)
+        pt[1][2][0] = np.random.randint(x1, x2)
+        pt[1][2][1] = np.random.randint(y1, y2)
+        color = "%06x" % np.random.randint(0, 0xFFFFFF)
+        color = tuple(int(color[i:i+2], 16) for i in (0, 2 ,4))
+        alist = []
+        for k in pt[0]:
+            alist.append(k)
+        for k in pt[1]:
+            alist.append(k)
+        ppt = np.array(alist)
+        cv.polylines(image, [ppt], True, color, thickness = np.random.randint(1, 10), lineType = lineType)
+        cv.imshow(wndname, image)
+        if cv.waitKey(DELAY) >= 0:
+            return
+
+# fills an area bounded by several polygonal contours
+def fill():
+    for i in range(NUMBER):
+        pt = [(0, 0)]*6
+        pt = np.resize(pt, (2, 3, 2))
+        pt[0][0][0] = np.random.randint(x1, x2)
+        pt[0][0][1] = np.random.randint(y1, y2)
+        pt[0][1][0] = np.random.randint(x1, x2)
+        pt[0][1][1] = np.random.randint(y1, y2)
+        pt[0][2][0] = np.random.randint(x1, x2)
+        pt[0][2][1] = np.random.randint(y1, y2)
+        pt[1][0][0] = np.random.randint(x1, x2)
+        pt[1][0][1] = np.random.randint(y1, y2)
+        pt[1][1][0] = np.random.randint(x1, x2)
+        pt[1][1][1] = np.random.randint(y1, y2)
+        pt[1][2][0] = np.random.randint(x1, x2)
+        pt[1][2][1] = np.random.randint(y1, y2)
+        color = "%06x" % np.random.randint(0, 0xFFFFFF)
+        color = tuple(int(color[i:i+2], 16) for i in (0, 2 ,4))
+        alist = []
+        for k in pt[0]:
+            alist.append(k)
+        for k in pt[1]:
+            alist.append(k)
+        ppt = np.array(alist)
+        cv.fillPoly(image, [ppt], color, lineType)
+        cv.imshow(wndname, image)
+        if cv.waitKey(DELAY) >= 0:
+            return
+
+# Drawing Circles
+def circles():
+    for i in range(NUMBER):
+        center = []
+        center.append(np.random.randint(x1, x2))
+        center.append(np.random.randint(x1, x2))
+        color = "%06x" % np.random.randint(0, 0xFFFFFF)
+        color = tuple(int(color[i:i+2], 16) for i in (0, 2 ,4))
+        cv.circle(image, tuple(center), np.random.randint(0, 300), color, np.random.randint(-1, 9), lineType)
+        cv.imshow(wndname, image)
+        if cv.waitKey(DELAY) >= 0:
+            return
+
+# Draws a text string
+def string():
+    for i in range(NUMBER):
+        org = []
+        org.append(np.random.randint(x1, x2))
+        org.append(np.random.randint(x1, x2))
+        color = "%06x" % np.random.randint(0, 0xFFFFFF)
+        color = tuple(int(color[i:i+2], 16) for i in (0, 2 ,4))
+        cv.putText(image, "Testing text rendering", tuple(org), np.random.randint(0, 8), np.random.randint(0, 100)*0.05+0.1, color, np.random.randint(1, 10), lineType)
+        cv.imshow(wndname, image)
+        if cv.waitKey(DELAY) >= 0:
+            return
+
+
+def string1():
+    textsize = cv.getTextSize("OpenCV forever!", cv.FONT_HERSHEY_COMPLEX, 3, 5)
+    org = (int((width - textsize[0][0])/2), int((height - textsize[0][1])/2))
+    for i in range(0, 255, 2):
+        image2 = np.array(image) - i
+        cv.putText(image2, "OpenCV forever!", org, cv.FONT_HERSHEY_COMPLEX, 3, (i, i, 255), 5, lineType)
+        cv.imshow(wndname, image2)
+        if cv.waitKey(DELAY) >= 0:
+            return
 
 if __name__ == '__main__':
-
-    # some "constants"
-    width = 1000
-    height = 700
-    window_name = "Drawing Demo"
-    number = 100
-    delay = 5
-    line_type = cv.CV_AA  # change it to 8 to see non-antialiased graphics
-
-    # create the source image
-    image = cv.CreateImage( (width, height), 8, 3)
-
-    # create window and display the original picture in it
-    cv.NamedWindow(window_name, 1)
-    cv.SetZero(image)
-    cv.ShowImage(window_name, image)
-
-    # create the random number
-    random = Random()
-
-    # draw some lines
-    for i in range(number):
-        pt1 =  (random.randrange(-width, 2 * width),
-                          random.randrange(-height, 2 * height))
-        pt2 =  (random.randrange(-width, 2 * width),
-                          random.randrange(-height, 2 * height))
-        cv.Line(image, pt1, pt2,
-                   random_color(random),
-                   random.randrange(0, 10),
-                   line_type, 0)
-
-        cv.ShowImage(window_name, image)
-        cv.WaitKey(delay)
-
-    # draw some rectangles
-    for i in range(number):
-        pt1 =  (random.randrange(-width, 2 * width),
-                          random.randrange(-height, 2 * height))
-        pt2 =  (random.randrange(-width, 2 * width),
-                          random.randrange(-height, 2 * height))
-        cv.Rectangle(image, pt1, pt2,
-                        random_color(random),
-                        random.randrange(-1, 9),
-                        line_type, 0)
-
-        cv.ShowImage(window_name, image)
-        cv.WaitKey(delay)
-
-    # draw some ellipes
-    for i in range(number):
-        pt1 =  (random.randrange(-width, 2 * width),
-                          random.randrange(-height, 2 * height))
-        sz =  (random.randrange(0, 200),
-                        random.randrange(0, 200))
-        angle = random.randrange(0, 1000) * 0.180
-        cv.Ellipse(image, pt1, sz, angle, angle - 100, angle + 200,
-                        random_color(random),
-                        random.randrange(-1, 9),
-                        line_type, 0)
-
-        cv.ShowImage(window_name, image)
-        cv.WaitKey(delay)
-
-    # init the list of polylines
-    nb_polylines = 2
-    polylines_size = 3
-    pt = [0,] * nb_polylines
-    for a in range(nb_polylines):
-        pt [a] = [0,] * polylines_size
-
-    # draw some polylines
-    for i in range(number):
-        for a in range(nb_polylines):
-            for b in range(polylines_size):
-                pt [a][b] =  (random.randrange(-width, 2 * width),
-                                     random.randrange(-height, 2 * height))
-        cv.PolyLine(image, pt, 1,
-                       random_color(random),
-                       random.randrange(1, 9),
-                       line_type, 0)
-
-        cv.ShowImage(window_name, image)
-        cv.WaitKey(delay)
-
-    # draw some filled polylines
-    for i in range(number):
-        for a in range(nb_polylines):
-            for b in range(polylines_size):
-                pt [a][b] =  (random.randrange(-width, 2 * width),
-                                     random.randrange(-height, 2 * height))
-        cv.FillPoly(image, pt,
-                       random_color(random),
-                       line_type, 0)
-
-        cv.ShowImage(window_name, image)
-        cv.WaitKey(delay)
-
-    # draw some circles
-    for i in range(number):
-        pt1 =  (random.randrange(-width, 2 * width),
-                          random.randrange(-height, 2 * height))
-        cv.Circle(image, pt1, random.randrange(0, 300),
-                     random_color(random),
-                     random.randrange(-1, 9),
-                     line_type, 0)
-
-        cv.ShowImage(window_name, image)
-        cv.WaitKey(delay)
-
-    # draw some text
-    for i in range(number):
-        pt1 =  (random.randrange(-width, 2 * width),
-                          random.randrange(-height, 2 * height))
-        font = cv.InitFont(random.randrange(0, 8),
-                              random.randrange(0, 100) * 0.05 + 0.01,
-                              random.randrange(0, 100) * 0.05 + 0.01,
-                              random.randrange(0, 5) * 0.1,
-                              random.randrange(0, 10),
-                              line_type)
-
-        cv.PutText(image, "Testing text rendering!",
-                      pt1, font,
-                      random_color(random))
-
-        cv.ShowImage(window_name, image)
-        cv.WaitKey(delay)
-
-    # prepare a text, and get it's properties
-    font = cv.InitFont(cv.CV_FONT_HERSHEY_COMPLEX,
-                          3, 3, 0.0, 5, line_type)
-    text_size, ymin = cv.GetTextSize("OpenCV forever!", font)
-    pt1 = ((width - text_size[0]) / 2, (height + text_size[1]) / 2)
-    image2 = cv.CloneImage(image)
-
-    # now, draw some OpenCV pub ;-)
-    for i in range(0, 512, 2):
-        cv.SubS(image2, cv.ScalarAll(i), image)
-        (r, g, b) = colorsys.hsv_to_rgb((i % 100) / 100., 1, 1)
-        cv.PutText(image, "OpenCV forever!",
-                      pt1, font, cv.RGB(255 * r, 255 * g, 255 * b))
-        cv.ShowImage(window_name, image)
-        cv.WaitKey(delay)
-
-    # wait some key to end
-    cv.WaitKey(0)
-    cv.DestroyAllWindows()
+    print(__doc__)
+    wndname = "Drawing Demo"
+    NUMBER = 100
+    DELAY = 5
+    width, height = 1000, 700
+    lineType = cv.LINE_AA  # change it to LINE_8 to see non-antialiased graphics
+    x1, x2, y1, y2 = -width/2, width*3/2, -height/2, height*3/2
+    image = np.zeros((height, width, 3), dtype = np.uint8)
+    cv.imshow(wndname, image)
+    cv.waitKey(DELAY)
+    lines()
+    rectangle()
+    ellipse()
+    polygonal()
+    fill()
+    circles()
+    string()
+    string1()
+    cv.waitKey(0)
+    cv.destroyAllWindows()

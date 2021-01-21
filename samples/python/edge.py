@@ -1,60 +1,60 @@
-#! /usr/bin/env python
+#!/usr/bin/env python
 
-print "OpenCV Python version of edge"
+'''
+This sample demonstrates Canny edge detection.
 
+Usage:
+  edge.py [<video source>]
+
+  Trackbars control edge thresholds.
+
+'''
+
+# Python 2/3 compatibility
+from __future__ import print_function
+
+import cv2 as cv
+import numpy as np
+
+# relative module
+import video
+
+# built-in module
 import sys
-import urllib2
-import cv2.cv as cv
 
-# some definitions
-win_name = "Edge"
-trackbar_name = "Threshold"
 
-# the callback on the trackbar
-def on_trackbar(position):
+def main():
+    try:
+        fn = sys.argv[1]
+    except:
+        fn = 0
 
-    cv.Smooth(gray, edge, cv.CV_BLUR, 3, 3, 0)
-    cv.Not(gray, edge)
+    def nothing(*arg):
+        pass
 
-    # run the edge dector on gray scale
-    cv.Canny(gray, edge, position, position * 3, 3)
+    cv.namedWindow('edge')
+    cv.createTrackbar('thrs1', 'edge', 2000, 5000, nothing)
+    cv.createTrackbar('thrs2', 'edge', 4000, 5000, nothing)
 
-    # reset
-    cv.SetZero(col_edge)
+    cap = video.create_capture(fn)
+    while True:
+        _flag, img = cap.read()
+        gray = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
+        thrs1 = cv.getTrackbarPos('thrs1', 'edge')
+        thrs2 = cv.getTrackbarPos('thrs2', 'edge')
+        edge = cv.Canny(gray, thrs1, thrs2, apertureSize=5)
+        vis = img.copy()
+        vis = np.uint8(vis/2.)
+        vis[edge != 0] = (0, 255, 0)
+        cv.imshow('edge', vis)
+        ch = cv.waitKey(5)
+        if ch == 27:
+            break
 
-    # copy edge points
-    cv.Copy(im, col_edge, edge)
+    print('Done')
 
-    # show the im
-    cv.ShowImage(win_name, col_edge)
 
 if __name__ == '__main__':
-    if len(sys.argv) > 1:
-        im = cv.LoadImage( sys.argv[1], cv.CV_LOAD_IMAGE_COLOR)
-    else:
-        url = 'http://code.opencv.org/projects/opencv/repository/revisions/master/raw/samples/c/fruits.jpg'
-        filedata = urllib2.urlopen(url).read()
-        imagefiledata = cv.CreateMatHeader(1, len(filedata), cv.CV_8UC1)
-        cv.SetData(imagefiledata, filedata, len(filedata))
-        im = cv.DecodeImage(imagefiledata, cv.CV_LOAD_IMAGE_COLOR)
-
-    # create the output im
-    col_edge = cv.CreateImage((im.width, im.height), 8, 3)
-
-    # convert to grayscale
-    gray = cv.CreateImage((im.width, im.height), 8, 1)
-    edge = cv.CreateImage((im.width, im.height), 8, 1)
-    cv.CvtColor(im, gray, cv.CV_BGR2GRAY)
-
-    # create the window
-    cv.NamedWindow(win_name, cv.CV_WINDOW_AUTOSIZE)
-
-    # create the trackbar
-    cv.CreateTrackbar(trackbar_name, win_name, 1, 100, on_trackbar)
-
-    # show the im
-    on_trackbar(0)
-
-    # wait a key pressed to end
-    cv.WaitKey(0)
-    cv.DestroyAllWindows()
+    print(__doc__)
+    main()
+    cv.destroyAllWindows()

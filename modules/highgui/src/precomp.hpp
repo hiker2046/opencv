@@ -42,12 +42,16 @@
 #ifndef __HIGHGUI_H_
 #define __HIGHGUI_H_
 
-#include "cvconfig.h"
+#include "opencv2/highgui.hpp"
 
-#include "opencv2/highgui/highgui.hpp"
-#include "opencv2/highgui/highgui_c.h"
+#include "opencv2/core/utility.hpp"
+#include "opencv2/core/private.hpp"
+
+#include "opencv2/imgproc.hpp"
 #include "opencv2/imgproc/imgproc_c.h"
-#include "opencv2/core/internal.hpp"
+#include "opencv2/highgui/highgui_c.h"
+
+#include "opencv2/imgcodecs.hpp"
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -56,16 +60,12 @@
 #include <ctype.h>
 #include <assert.h>
 
-#if defined WIN32 || defined WINCE
+#if defined _WIN32 || defined WINCE
     #include <windows.h>
     #undef small
     #undef min
     #undef max
     #undef abs
-#endif
-
-#ifdef HAVE_TEGRA_OPTIMIZATION
-#include "opencv2/highgui/highgui_tegra.hpp"
 #endif
 
 /* Errors */
@@ -83,105 +83,20 @@
 #define CV_WINDOW_MAGIC_VAL     0x00420042
 #define CV_TRACKBAR_MAGIC_VAL   0x00420043
 
-/***************************** CvCapture structure ******************************/
-
-struct CvCapture
-{
-    virtual ~CvCapture() {}
-    virtual double getProperty(int) { return 0; }
-    virtual bool setProperty(int, double) { return 0; }
-    virtual bool grabFrame() { return true; }
-    virtual IplImage* retrieveFrame(int) { return 0; }
-    virtual int getCaptureDomain() { return CV_CAP_ANY; } // Return the type of the capture object: CV_CAP_VFW, etc...
-};
-
-/*************************** CvVideoWriter structure ****************************/
-
-struct CvVideoWriter
-{
-    virtual ~CvVideoWriter() {}
-    virtual bool writeFrame(const IplImage*) { return false; }
-};
-
-#if defined WIN32 || defined _WIN32
-#define HAVE_VFW 1
-
-/* uncomment to enable CMUCamera1394 fireware camera module */
-//#define HAVE_CMU1394 1
-#endif
-
-
-CvCapture * cvCreateCameraCapture_V4L( int index );
-CvCapture * cvCreateCameraCapture_DC1394( int index );
-CvCapture * cvCreateCameraCapture_DC1394_2( int index );
-CvCapture* cvCreateCameraCapture_MIL( int index );
-CvCapture* cvCreateCameraCapture_Giganetix( int index );
-CvCapture * cvCreateCameraCapture_CMU( int index );
-CV_IMPL CvCapture * cvCreateCameraCapture_TYZX( int index );
-CvCapture* cvCreateFileCapture_Win32( const char* filename );
-CvCapture* cvCreateCameraCapture_VFW( int index );
-CvCapture* cvCreateFileCapture_VFW( const char* filename );
-CvVideoWriter* cvCreateVideoWriter_Win32( const char* filename, int fourcc,
-                                          double fps, CvSize frameSize, int is_color );
-CvVideoWriter* cvCreateVideoWriter_VFW( const char* filename, int fourcc,
-                                        double fps, CvSize frameSize, int is_color );
-CvCapture* cvCreateCameraCapture_DShow( int index );
-CvCapture* cvCreateCameraCapture_OpenNI( int index );
-CvCapture* cvCreateFileCapture_OpenNI( const char* filename );
-CvCapture* cvCreateCameraCapture_Android( int index );
-CvCapture* cvCreateCameraCapture_XIMEA( int index );
-CvCapture* cvCreateCameraCapture_AVFoundation(int index);
-
-
-CVAPI(int) cvHaveImageReader(const char* filename);
-CVAPI(int) cvHaveImageWriter(const char* filename);
-
-CvCapture* cvCreateFileCapture_Images(const char* filename);
-CvVideoWriter* cvCreateVideoWriter_Images(const char* filename);
-
-CvCapture* cvCreateFileCapture_XINE (const char* filename);
-
-
-
-
-#define CV_CAP_GSTREAMER_1394		0
-#define CV_CAP_GSTREAMER_V4L		1
-#define CV_CAP_GSTREAMER_V4L2		2
-#define CV_CAP_GSTREAMER_FILE		3
-
-CvCapture* cvCreateCapture_GStreamer(int type, const char *filename);
-CvCapture* cvCreateFileCapture_FFMPEG_proxy(const char* filename);
-
-
-CvVideoWriter* cvCreateVideoWriter_FFMPEG_proxy( const char* filename, int fourcc,
-                                            double fps, CvSize frameSize, int is_color );
-
-CvCapture * cvCreateFileCapture_QT (const char  * filename);
-CvCapture * cvCreateCameraCapture_QT  (const int     index);
-
-CvVideoWriter* cvCreateVideoWriter_QT ( const char* filename, int fourcc,
-                                        double fps, CvSize frameSize, int is_color );
-
-CvCapture* cvCreateFileCapture_AVFoundation (const char * filename);
-CvVideoWriter* cvCreateVideoWriter_AVFoundation( const char* filename, int fourcc,
-                                                double fps, CvSize frameSize, int is_color );
-
-
-CvCapture * cvCreateCameraCapture_Unicap  (const int     index);
-CvCapture * cvCreateCameraCapture_PvAPI  (const int     index);
-CvVideoWriter* cvCreateVideoWriter_GStreamer( const char* filename, int fourcc,
-                                            double fps, CvSize frameSize, int is_color );
-
-//Yannick Verdie 2010
+//Yannick Verdie 2010, Max Kostin 2015
 void cvSetModeWindow_W32(const char* name, double prop_value);
 void cvSetModeWindow_GTK(const char* name, double prop_value);
-void cvSetModeWindow_CARBON(const char* name, double prop_value);
 void cvSetModeWindow_COCOA(const char* name, double prop_value);
+void cvSetModeWindow_WinRT(const char* name, double prop_value);
+
+CvRect cvGetWindowRect_W32(const char* name);
+CvRect cvGetWindowRect_GTK(const char* name);
+CvRect cvGetWindowRect_COCOA(const char* name);
 
 double cvGetModeWindow_W32(const char* name);
 double cvGetModeWindow_GTK(const char* name);
-double cvGetModeWindow_CARBON(const char* name);
 double cvGetModeWindow_COCOA(const char* name);
+double cvGetModeWindow_WinRT(const char* name);
 
 double cvGetPropWindowAutoSize_W32(const char* name);
 double cvGetPropWindowAutoSize_GTK(const char* name);
@@ -192,8 +107,17 @@ double cvGetRatioWindow_GTK(const char* name);
 double cvGetOpenGlProp_W32(const char* name);
 double cvGetOpenGlProp_GTK(const char* name);
 
+double cvGetPropVisible_W32(const char* name);
+
+double cvGetPropTopmost_W32(const char* name);
+double cvGetPropTopmost_COCOA(const char* name);
+
+void cvSetPropTopmost_W32(const char* name, const bool topmost);
+void cvSetPropTopmost_COCOA(const char* name, const bool topmost);
+
 //for QT
 #if defined (HAVE_QT)
+CvRect cvGetWindowRect_QT(const char* name);
 double cvGetModeWindow_QT(const char* name);
 void cvSetModeWindow_QT(const char* name, double prop_value);
 
@@ -204,46 +128,42 @@ double cvGetRatioWindow_QT(const char* name);
 void cvSetRatioWindow_QT(const char* name,double prop_value);
 
 double cvGetOpenGlProp_QT(const char* name);
+double cvGetPropVisible_QT(const char* name);
 #endif
 
-// OpenGL
-typedef void (CV_CDECL *CvOpenGlCleanCallback)(void* userdata);
-void icvSetOpenGlCleanCallback(const char* window_name, CvOpenGlCleanCallback callback, void* userdata);
-
-
-/*namespace cv
+inline void convertToShow(const cv::Mat &src, cv::Mat &dst, bool toRGB = true)
 {
+    const int src_depth = src.depth();
+    CV_Assert(src_depth != CV_16F && src_depth != CV_32S);
+    cv::Mat tmp;
+    switch(src_depth)
+    {
+    case CV_8U:
+        tmp = src;
+        break;
+    case CV_8S:
+        cv::convertScaleAbs(src, tmp, 1, 127);
+        break;
+    case CV_16S:
+        cv::convertScaleAbs(src, tmp, 1/255., 127);
+        break;
+    case CV_16U:
+        cv::convertScaleAbs(src, tmp, 1/255.);
+        break;
+    case CV_32F:
+    case CV_64F: // assuming image has values in range [0, 1)
+        src.convertTo(tmp, CV_8U, 255., 0.);
+        break;
+    }
+    cv::cvtColor(tmp, dst, toRGB ? cv::COLOR_BGR2RGB : cv::COLOR_BGRA2BGR, dst.channels());
+}
 
-class CV_EXPORTS BaseWindow
+inline void convertToShow(const cv::Mat &src, const CvMat* arr, bool toRGB = true)
 {
-public:
-    BaseWindow(const String& name, int flags=0);
-    virtual ~BaseWindow();
-    virtual void close();
-    virtual void show(const Mat& mat);
-    virtual void resize(Size size);
-    virtual void move(Point topleft);
-    virtual Size size() const;
-    virtual Point topLeft() const;
-    virtual void setGeometry(Point topLeft, Size size);
-    virtual void getGeometry(Point& topLeft, Size& size) const;
-    virtual String getTitle() const;
-    virtual void setTitle(const String& str);
-    virtual String getName() const;
-    virtual void setScaleMode(int mode);
-    virtual int getScaleMode();
-    virtual void setScrollPos(double pos);
-    virtual double getScrollPos() const;
-    virtual void setScale(double scale);
-    virtual double getScale() const;
-    virtual Point getImageCoords(Point pos) const;
-    virtual Scalar getPixelValue(Point pos, const String& colorspace=String()) const;
+    cv::Mat dst = cv::cvarrToMat(arr);
+    convertToShow(src, dst, toRGB);
+    CV_Assert(dst.data == arr->data.ptr);
+}
 
-    virtual void addTrackbar( const String& trackbar, int low, int high, int step );
-};
-
-typedef Ptr<BaseWindow> Window;
-
-}*/
 
 #endif /* __HIGHGUI_H_ */

@@ -1,21 +1,20 @@
+// This file is part of OpenCV project.
+// It is subject to the license terms in the LICENSE file found in the top-level directory
+// of this distribution and at http://opencv.org/license.html.
 #include "perf_precomp.hpp"
 
-using namespace std;
-using namespace cv;
-using namespace perf;
-using std::tr1::make_tuple;
-using std::tr1::get;
+namespace opencv_test {
 
 CV_ENUM(ThreshType, THRESH_BINARY, THRESH_BINARY_INV, THRESH_TRUNC, THRESH_TOZERO, THRESH_TOZERO_INV)
 
-typedef std::tr1::tuple<Size, MatType, ThreshType> Size_MatType_ThreshType_t;
+typedef tuple<Size, MatType, ThreshType> Size_MatType_ThreshType_t;
 typedef perf::TestBaseWithParam<Size_MatType_ThreshType_t> Size_MatType_ThreshType;
 
 PERF_TEST_P(Size_MatType_ThreshType, threshold,
             testing::Combine(
                 testing::Values(TYPICAL_MAT_SIZES),
-                testing::Values(CV_8UC1, CV_16SC1),
-                testing::ValuesIn(ThreshType::all())
+                testing::Values(CV_8UC1, CV_16SC1, CV_32FC1, CV_64FC1),
+                ThreshType::all()
                 )
             )
 {
@@ -31,9 +30,9 @@ PERF_TEST_P(Size_MatType_ThreshType, threshold,
     double maxval = theRNG().uniform(1, 254);
 
     declare.in(src, WARMUP_RNG).out(dst);
-    declare.time(100);
 
-    TEST_CYCLE() threshold(src, dst, thresh, maxval, threshType);
+    int runs = (sz.width <= 640) ? 40 : 1;
+    TEST_CYCLE_MULTIRUN(runs) cv::threshold(src, dst, thresh, maxval, threshType);
 
     SANITY_CHECK(dst);
 }
@@ -51,7 +50,8 @@ PERF_TEST_P(Size_Only, threshold_otsu, testing::Values(TYPICAL_MAT_SIZES))
 
     declare.in(src, WARMUP_RNG).out(dst);
 
-    TEST_CYCLE() threshold(src, dst, 0, maxval, THRESH_BINARY|THRESH_OTSU);
+    int runs = 15;
+    TEST_CYCLE_MULTIRUN(runs) cv::threshold(src, dst, 0, maxval, THRESH_BINARY|THRESH_OTSU);
 
     SANITY_CHECK(dst);
 }
@@ -59,15 +59,16 @@ PERF_TEST_P(Size_Only, threshold_otsu, testing::Values(TYPICAL_MAT_SIZES))
 CV_ENUM(AdaptThreshType, THRESH_BINARY, THRESH_BINARY_INV)
 CV_ENUM(AdaptThreshMethod, ADAPTIVE_THRESH_MEAN_C, ADAPTIVE_THRESH_GAUSSIAN_C)
 
-typedef std::tr1::tuple<Size, AdaptThreshType, AdaptThreshMethod, int> Size_AdaptThreshType_AdaptThreshMethod_BlockSize_t;
-typedef perf::TestBaseWithParam<Size_AdaptThreshType_AdaptThreshMethod_BlockSize_t> Size_AdaptThreshType_AdaptThreshMethod_BlockSize;
+typedef tuple<Size, AdaptThreshType, AdaptThreshMethod, int, double> Size_AdaptThreshType_AdaptThreshMethod_BlockSize_Delta_t;
+typedef perf::TestBaseWithParam<Size_AdaptThreshType_AdaptThreshMethod_BlockSize_Delta_t> Size_AdaptThreshType_AdaptThreshMethod_BlockSize_Delta;
 
-PERF_TEST_P(Size_AdaptThreshType_AdaptThreshMethod_BlockSize, adaptiveThreshold,
+PERF_TEST_P(Size_AdaptThreshType_AdaptThreshMethod_BlockSize_Delta, adaptiveThreshold,
             testing::Combine(
                 testing::Values(TYPICAL_MAT_SIZES),
-                testing::ValuesIn(AdaptThreshType::all()),
-                testing::ValuesIn(AdaptThreshMethod::all()),
-                testing::Values(3, 5)
+                AdaptThreshType::all(),
+                AdaptThreshMethod::all(),
+                testing::Values(3, 5),
+                testing::Values(0.0, 10.0)
                 )
             )
 {
@@ -75,17 +76,21 @@ PERF_TEST_P(Size_AdaptThreshType_AdaptThreshMethod_BlockSize, adaptiveThreshold,
     AdaptThreshType adaptThreshType = get<1>(GetParam());
     AdaptThreshMethod adaptThreshMethod = get<2>(GetParam());
     int blockSize = get<3>(GetParam());
+    double C = get<4>(GetParam());
 
     double maxValue = theRNG().uniform(1, 254);
-    double C = 10.0;
 
     int type = CV_8UC1;
-    Mat src(sz, type);
+
+    Mat src_full(cv::Size(sz.width + 2, sz.height + 2), type);
+    Mat src = src_full(cv::Rect(1, 1, sz.width, sz.height));
     Mat dst(sz, type);
 
     declare.in(src, WARMUP_RNG).out(dst);
 
-    TEST_CYCLE() adaptiveThreshold(src, dst, maxValue, adaptThreshMethod, adaptThreshType, blockSize, C);
+    TEST_CYCLE() cv::adaptiveThreshold(src, dst, maxValue, adaptThreshMethod, adaptThreshType, blockSize, C);
 
     SANITY_CHECK(dst);
 }
+
+} // namespace

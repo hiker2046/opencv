@@ -31,6 +31,8 @@
 #ifndef OPENCV_FLANN_GROUND_TRUTH_H_
 #define OPENCV_FLANN_GROUND_TRUTH_H_
 
+//! @cond IGNORED
+
 #include "dist.h"
 #include "matrix.h"
 
@@ -42,7 +44,6 @@ template <typename Distance>
 void find_nearest(const Matrix<typename Distance::ElementType>& dataset, typename Distance::ElementType* query, int* matches, int nn,
                   int skip = 0, Distance distance = Distance())
 {
-    typedef typename Distance::ElementType ElementType;
     typedef typename Distance::ResultType DistanceType;
     int n = nn + skip;
 
@@ -91,5 +92,7 @@ void compute_ground_truth(const Matrix<typename Distance::ElementType>& dataset,
 
 
 }
+
+//! @endcond
 
 #endif //OPENCV_FLANN_GROUND_TRUTH_H_

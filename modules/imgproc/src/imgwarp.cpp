@@ -12,6 +12,7 @@
 //
 // Copyright (C) 2000-2008, Intel Corporation, all rights reserved.
 // Copyright (C) 2009, Willow Garage Inc., all rights reserved.
+// Copyright (C) 2014-2015, Itseez Inc., all rights reserved.
 // Third party copyrights are property of their respective owners.
 //
 // Redistribution and use in source and binary forms, with or without modification,
@@ -47,16 +48,81 @@
 // */
 
 #include "precomp.hpp"
-#include <iostream>
-#include <vector>
+#include "opencl_kernels_imgproc.hpp"
+#include "hal_replacement.hpp"
+#include <opencv2/core/utils/configuration.private.hpp>
+#include "opencv2/core/hal/intrin.hpp"
+#include "opencv2/core/openvx/ovx_defs.hpp"
+#include "opencv2/core/softfloat.hpp"
+#include "imgwarp.hpp"
+
+using namespace cv;
 
 namespace cv
 {
 
-/************** interpolation formulas and tables ***************/
+#if defined (HAVE_IPP) && (!IPP_DISABLE_WARPAFFINE || !IPP_DISABLE_WARPPERSPECTIVE || !IPP_DISABLE_REMAP)
+typedef IppStatus (CV_STDCALL* ippiSetFunc)(const void*, void *, int, IppiSize);
 
-const int INTER_RESIZE_COEF_BITS=11;
-const int INTER_RESIZE_COEF_SCALE=1 << INTER_RESIZE_COEF_BITS;
+template <int channels, typename Type>
+bool IPPSetSimple(cv::Scalar value, void *dataPointer, int step, IppiSize &size, ippiSetFunc func)
+{
+    CV_INSTRUMENT_REGION_IPP();
+
+    Type values[channels];
+    for( int i = 0; i < channels; i++ )
+        values[i] = saturate_cast<Type>(value[i]);
+    return func(values, dataPointer, step, size) >= 0;
+}
+
+static bool IPPSet(const cv::Scalar &value, void *dataPointer, int step, IppiSize &size, int channels, int depth)
+{
+    CV_INSTRUMENT_REGION_IPP();
+
+    if( channels == 1 )
+    {
+        switch( depth )
+        {
+        case CV_8U:
+            return CV_INSTRUMENT_FUN_IPP(ippiSet_8u_C1R, saturate_cast<Ipp8u>(value[0]), (Ipp8u *)dataPointer, step, size) >= 0;
+        case CV_16U:
+            return CV_INSTRUMENT_FUN_IPP(ippiSet_16u_C1R, saturate_cast<Ipp16u>(value[0]), (Ipp16u *)dataPointer, step, size) >= 0;
+        case CV_32F:
+            return CV_INSTRUMENT_FUN_IPP(ippiSet_32f_C1R, saturate_cast<Ipp32f>(value[0]), (Ipp32f *)dataPointer, step, size) >= 0;
+        }
+    }
+    else
+    {
+        if( channels == 3 )
+        {
+            switch( depth )
+            {
+            case CV_8U:
+                return IPPSetSimple<3, Ipp8u>(value, dataPointer, step, size, (ippiSetFunc)ippiSet_8u_C3R);
+            case CV_16U:
+                return IPPSetSimple<3, Ipp16u>(value, dataPointer, step, size, (ippiSetFunc)ippiSet_16u_C3R);
+            case CV_32F:
+                return IPPSetSimple<3, Ipp32f>(value, dataPointer, step, size, (ippiSetFunc)ippiSet_32f_C3R);
+            }
+        }
+        else if( channels == 4 )
+        {
+            switch( depth )
+            {
+            case CV_8U:
+                return IPPSetSimple<4, Ipp8u>(value, dataPointer, step, size, (ippiSetFunc)ippiSet_8u_C4R);
+            case CV_16U:
+                return IPPSetSimple<4, Ipp16u>(value, dataPointer, step, size, (ippiSetFunc)ippiSet_16u_C4R);
+            case CV_32F:
+                return IPPSetSimple<4, Ipp32f>(value, dataPointer, step, size, (ippiSetFunc)ippiSet_32f_C4R);
+            }
+        }
+    }
+    return false;
+}
+#endif
+
+/************** interpolation formulas and tables ***************/
 
 const int INTER_REMAP_COEF_BITS=15;
 const int INTER_REMAP_COEF_SCALE=1 << INTER_REMAP_COEF_BITS;
@@ -66,7 +132,7 @@ static uchar NNDeltaTab_i[INTER_TAB_SIZE2][2];
 static float BilinearTab_f[INTER_TAB_SIZE2][2][2];
 static short BilinearTab_i[INTER_TAB_SIZE2][2][2];
 
-#if CV_SSE2
+#if CV_SIMD128
 static short BilinearTab_iC4_buf[INTER_TAB_SIZE2+2][2][8];
 static short (*BilinearTab_iC4)[2][8] = (short (*)[2][8])alignPtr(BilinearTab_iC4_buf, 16);
 #endif
@@ -108,7 +174,7 @@ static inline void interpolateLanczos4( float x, float* coeffs )
     }
 
     float sum = 0;
-    double y0=-(x+3)*CV_PI*0.25, s0 = sin(y0), c0=cos(y0);
+    double y0=-(x+3)*CV_PI*0.25, s0 = std::sin(y0), c0= std::cos(y0);
     for(int i = 0; i < 8; i++ )
     {
         double y = -(x+3-i)*CV_PI*0.25;
@@ -163,7 +229,7 @@ static const void* initInterTab2D( int method, bool fixpt )
     {
         AutoBuffer<float> _tab(8*INTER_TAB_SIZE);
         int i, j, k1, k2;
-        initInterTab1D(method, _tab, INTER_TAB_SIZE);
+        initInterTab1D(method, _tab.data(), INTER_TAB_SIZE);
         for( i = 0; i < INTER_TAB_SIZE; i++ )
             for( j = 0; j < INTER_TAB_SIZE; j++, tab += ksize*ksize, itab += ksize*ksize )
             {
@@ -202,7 +268,7 @@ static const void* initInterTab2D( int method, bool fixpt )
             }
         tab -= INTER_TAB_SIZE2*ksize*ksize;
         itab -= INTER_TAB_SIZE2*ksize*ksize;
-#if CV_SSE2
+#if CV_SIMD128
         if( method == INTER_LINEAR )
         {
             for( i = 0; i < INTER_TAB_SIZE2; i++ )
@@ -251,1726 +317,27 @@ template<typename ST, typename DT, int bits> struct FixedPtCast
     DT operator()(ST val) const { return saturate_cast<DT>((val + DELTA)>>SHIFT); }
 };
 
-/****************************************************************************************\
-*                                         Resize                                         *
-\****************************************************************************************/
-
-class resizeNNInvoker :
-    public ParallelLoopBody
-{
-public:
-    resizeNNInvoker(const Mat& _src, Mat &_dst, int *_x_ofs, int _pix_size4, double _ify) :
-        ParallelLoopBody(), src(_src), dst(_dst), x_ofs(_x_ofs), pix_size4(_pix_size4),
-        ify(_ify)
-    {
-    }
-
-    virtual void operator() (const Range& range) const
-    {
-        Size ssize = src.size(), dsize = dst.size();
-        int y, x, pix_size = (int)src.elemSize();
-
-        for( y = range.start; y < range.end; y++ )
-        {
-            uchar* D = dst.data + dst.step*y;
-            int sy = std::min(cvFloor(y*ify), ssize.height-1);
-            const uchar* S = src.data + src.step*sy;
-
-            switch( pix_size )
-            {
-            case 1:
-                for( x = 0; x <= dsize.width - 2; x += 2 )
-                {
-                    uchar t0 = S[x_ofs[x]];
-                    uchar t1 = S[x_ofs[x+1]];
-                    D[x] = t0;
-                    D[x+1] = t1;
-                }
-
-                for( ; x < dsize.width; x++ )
-                    D[x] = S[x_ofs[x]];
-                break;
-            case 2:
-                for( x = 0; x < dsize.width; x++ )
-                    *(ushort*)(D + x*2) = *(ushort*)(S + x_ofs[x]);
-                break;
-            case 3:
-                for( x = 0; x < dsize.width; x++, D += 3 )
-                {
-                    const uchar* _tS = S + x_ofs[x];
-                    D[0] = _tS[0]; D[1] = _tS[1]; D[2] = _tS[2];
-                }
-                break;
-            case 4:
-                for( x = 0; x < dsize.width; x++ )
-                    *(int*)(D + x*4) = *(int*)(S + x_ofs[x]);
-                break;
-            case 6:
-                for( x = 0; x < dsize.width; x++, D += 6 )
-                {
-                    const ushort* _tS = (const ushort*)(S + x_ofs[x]);
-                    ushort* _tD = (ushort*)D;
-                    _tD[0] = _tS[0]; _tD[1] = _tS[1]; _tD[2] = _tS[2];
-                }
-                break;
-            case 8:
-                for( x = 0; x < dsize.width; x++, D += 8 )
-                {
-                    const int* _tS = (const int*)(S + x_ofs[x]);
-                    int* _tD = (int*)D;
-                    _tD[0] = _tS[0]; _tD[1] = _tS[1];
-                }
-                break;
-            case 12:
-                for( x = 0; x < dsize.width; x++, D += 12 )
-                {
-                    const int* _tS = (const int*)(S + x_ofs[x]);
-                    int* _tD = (int*)D;
-                    _tD[0] = _tS[0]; _tD[1] = _tS[1]; _tD[2] = _tS[2];
-                }
-                break;
-            default:
-                for( x = 0; x < dsize.width; x++, D += pix_size )
-                {
-                    const int* _tS = (const int*)(S + x_ofs[x]);
-                    int* _tD = (int*)D;
-                    for( int k = 0; k < pix_size4; k++ )
-                        _tD[k] = _tS[k];
-                }
-            }
-        }
-    }
-
-private:
-    const Mat src;
-    Mat dst;
-    int* x_ofs, pix_size4;
-    double ify;
-
-    resizeNNInvoker(const resizeNNInvoker&);
-    resizeNNInvoker& operator=(const resizeNNInvoker&);
-};
-
-static void
-resizeNN( const Mat& src, Mat& dst, double fx, double fy )
-{
-    Size ssize = src.size(), dsize = dst.size();
-    AutoBuffer<int> _x_ofs(dsize.width);
-    int* x_ofs = _x_ofs;
-    int pix_size = (int)src.elemSize();
-    int pix_size4 = (int)(pix_size / sizeof(int));
-    double ifx = 1./fx, ify = 1./fy;
-    int x;
-
-    for( x = 0; x < dsize.width; x++ )
-    {
-        int sx = cvFloor(x*ifx);
-        x_ofs[x] = std::min(sx, ssize.width-1)*pix_size;
-    }
-
-    Range range(0, dsize.height);
-    resizeNNInvoker invoker(src, dst, x_ofs, pix_size4, ify);
-    parallel_for_(range, invoker, dst.total()/(double)(1<<16));
-}
-
-
-struct VResizeNoVec
-{
-    int operator()(const uchar**, uchar*, const uchar*, int ) const { return 0; }
-};
-
-struct HResizeNoVec
-{
-    int operator()(const uchar**, uchar**, int, const int*,
-        const uchar*, int, int, int, int, int) const { return 0; }
-};
-
-#if CV_SSE2
-
-struct VResizeLinearVec_32s8u
-{
-    int operator()(const uchar** _src, uchar* dst, const uchar* _beta, int width ) const
-    {
-        if( !checkHardwareSupport(CV_CPU_SSE2) )
-            return 0;
-
-        const int** src = (const int**)_src;
-        const short* beta = (const short*)_beta;
-        const int *S0 = src[0], *S1 = src[1];
-        int x = 0;
-        __m128i b0 = _mm_set1_epi16(beta[0]), b1 = _mm_set1_epi16(beta[1]);
-        __m128i delta = _mm_set1_epi16(2);
-
-        if( (((size_t)S0|(size_t)S1)&15) == 0 )
-            for( ; x <= width - 16; x += 16 )
-            {
-                __m128i x0, x1, x2, y0, y1, y2;
-                x0 = _mm_load_si128((const __m128i*)(S0 + x));
-                x1 = _mm_load_si128((const __m128i*)(S0 + x + 4));
-                y0 = _mm_load_si128((const __m128i*)(S1 + x));
-                y1 = _mm_load_si128((const __m128i*)(S1 + x + 4));
-                x0 = _mm_packs_epi32(_mm_srai_epi32(x0, 4), _mm_srai_epi32(x1, 4));
-                y0 = _mm_packs_epi32(_mm_srai_epi32(y0, 4), _mm_srai_epi32(y1, 4));
-
-                x1 = _mm_load_si128((const __m128i*)(S0 + x + 8));
-                x2 = _mm_load_si128((const __m128i*)(S0 + x + 12));
-                y1 = _mm_load_si128((const __m128i*)(S1 + x + 8));
-                y2 = _mm_load_si128((const __m128i*)(S1 + x + 12));
-                x1 = _mm_packs_epi32(_mm_srai_epi32(x1, 4), _mm_srai_epi32(x2, 4));
-                y1 = _mm_packs_epi32(_mm_srai_epi32(y1, 4), _mm_srai_epi32(y2, 4));
-
-                x0 = _mm_adds_epi16(_mm_mulhi_epi16( x0, b0 ), _mm_mulhi_epi16( y0, b1 ));
-                x1 = _mm_adds_epi16(_mm_mulhi_epi16( x1, b0 ), _mm_mulhi_epi16( y1, b1 ));
-
-                x0 = _mm_srai_epi16(_mm_adds_epi16(x0, delta), 2);
-                x1 = _mm_srai_epi16(_mm_adds_epi16(x1, delta), 2);
-                _mm_storeu_si128( (__m128i*)(dst + x), _mm_packus_epi16(x0, x1));
-            }
-        else
-            for( ; x <= width - 16; x += 16 )
-            {
-                __m128i x0, x1, x2, y0, y1, y2;
-                x0 = _mm_loadu_si128((const __m128i*)(S0 + x));
-                x1 = _mm_loadu_si128((const __m128i*)(S0 + x + 4));
-                y0 = _mm_loadu_si128((const __m128i*)(S1 + x));
-                y1 = _mm_loadu_si128((const __m128i*)(S1 + x + 4));
-                x0 = _mm_packs_epi32(_mm_srai_epi32(x0, 4), _mm_srai_epi32(x1, 4));
-                y0 = _mm_packs_epi32(_mm_srai_epi32(y0, 4), _mm_srai_epi32(y1, 4));
-
-                x1 = _mm_loadu_si128((const __m128i*)(S0 + x + 8));
-                x2 = _mm_loadu_si128((const __m128i*)(S0 + x + 12));
-                y1 = _mm_loadu_si128((const __m128i*)(S1 + x + 8));
-                y2 = _mm_loadu_si128((const __m128i*)(S1 + x + 12));
-                x1 = _mm_packs_epi32(_mm_srai_epi32(x1, 4), _mm_srai_epi32(x2, 4));
-                y1 = _mm_packs_epi32(_mm_srai_epi32(y1, 4), _mm_srai_epi32(y2, 4));
-
-                x0 = _mm_adds_epi16(_mm_mulhi_epi16( x0, b0 ), _mm_mulhi_epi16( y0, b1 ));
-                x1 = _mm_adds_epi16(_mm_mulhi_epi16( x1, b0 ), _mm_mulhi_epi16( y1, b1 ));
-
-                x0 = _mm_srai_epi16(_mm_adds_epi16(x0, delta), 2);
-                x1 = _mm_srai_epi16(_mm_adds_epi16(x1, delta), 2);
-                _mm_storeu_si128( (__m128i*)(dst + x), _mm_packus_epi16(x0, x1));
-            }
-
-        for( ; x < width - 4; x += 4 )
-        {
-            __m128i x0, y0;
-            x0 = _mm_srai_epi32(_mm_loadu_si128((const __m128i*)(S0 + x)), 4);
-            y0 = _mm_srai_epi32(_mm_loadu_si128((const __m128i*)(S1 + x)), 4);
-            x0 = _mm_packs_epi32(x0, x0);
-            y0 = _mm_packs_epi32(y0, y0);
-            x0 = _mm_adds_epi16(_mm_mulhi_epi16(x0, b0), _mm_mulhi_epi16(y0, b1));
-            x0 = _mm_srai_epi16(_mm_adds_epi16(x0, delta), 2);
-            x0 = _mm_packus_epi16(x0, x0);
-            *(int*)(dst + x) = _mm_cvtsi128_si32(x0);
-        }
-
-        return x;
-    }
-};
-
-
-template<int shiftval> struct VResizeLinearVec_32f16
-{
-    int operator()(const uchar** _src, uchar* _dst, const uchar* _beta, int width ) const
-    {
-        if( !checkHardwareSupport(CV_CPU_SSE2) )
-            return 0;
-
-        const float** src = (const float**)_src;
-        const float* beta = (const float*)_beta;
-        const float *S0 = src[0], *S1 = src[1];
-        ushort* dst = (ushort*)_dst;
-        int x = 0;
-
-        __m128 b0 = _mm_set1_ps(beta[0]), b1 = _mm_set1_ps(beta[1]);
-        __m128i preshift = _mm_set1_epi32(shiftval);
-        __m128i postshift = _mm_set1_epi16((short)shiftval);
-
-        if( (((size_t)S0|(size_t)S1)&15) == 0 )
-            for( ; x <= width - 16; x += 16 )
-            {
-                __m128 x0, x1, y0, y1;
-                __m128i t0, t1, t2;
-                x0 = _mm_load_ps(S0 + x);
-                x1 = _mm_load_ps(S0 + x + 4);
-                y0 = _mm_load_ps(S1 + x);
-                y1 = _mm_load_ps(S1 + x + 4);
-
-                x0 = _mm_add_ps(_mm_mul_ps(x0, b0), _mm_mul_ps(y0, b1));
-                x1 = _mm_add_ps(_mm_mul_ps(x1, b0), _mm_mul_ps(y1, b1));
-                t0 = _mm_add_epi32(_mm_cvtps_epi32(x0), preshift);
-                t2 = _mm_add_epi32(_mm_cvtps_epi32(x1), preshift);
-                t0 = _mm_add_epi16(_mm_packs_epi32(t0, t2), postshift);
-
-                x0 = _mm_load_ps(S0 + x + 8);
-                x1 = _mm_load_ps(S0 + x + 12);
-                y0 = _mm_load_ps(S1 + x + 8);
-                y1 = _mm_load_ps(S1 + x + 12);
-
-                x0 = _mm_add_ps(_mm_mul_ps(x0, b0), _mm_mul_ps(y0, b1));
-                x1 = _mm_add_ps(_mm_mul_ps(x1, b0), _mm_mul_ps(y1, b1));
-                t1 = _mm_add_epi32(_mm_cvtps_epi32(x0), preshift);
-                t2 = _mm_add_epi32(_mm_cvtps_epi32(x1), preshift);
-                t1 = _mm_add_epi16(_mm_packs_epi32(t1, t2), postshift);
-
-                _mm_storeu_si128( (__m128i*)(dst + x), t0);
-                _mm_storeu_si128( (__m128i*)(dst + x + 8), t1);
-            }
-        else
-            for( ; x <= width - 16; x += 16 )
-            {
-                __m128 x0, x1, y0, y1;
-                __m128i t0, t1, t2;
-                x0 = _mm_loadu_ps(S0 + x);
-                x1 = _mm_loadu_ps(S0 + x + 4);
-                y0 = _mm_loadu_ps(S1 + x);
-                y1 = _mm_loadu_ps(S1 + x + 4);
-
-                x0 = _mm_add_ps(_mm_mul_ps(x0, b0), _mm_mul_ps(y0, b1));
-                x1 = _mm_add_ps(_mm_mul_ps(x1, b0), _mm_mul_ps(y1, b1));
-                t0 = _mm_add_epi32(_mm_cvtps_epi32(x0), preshift);
-                t2 = _mm_add_epi32(_mm_cvtps_epi32(x1), preshift);
-                t0 = _mm_add_epi16(_mm_packs_epi32(t0, t2), postshift);
-
-                x0 = _mm_loadu_ps(S0 + x + 8);
-                x1 = _mm_loadu_ps(S0 + x + 12);
-                y0 = _mm_loadu_ps(S1 + x + 8);
-                y1 = _mm_loadu_ps(S1 + x + 12);
-
-                x0 = _mm_add_ps(_mm_mul_ps(x0, b0), _mm_mul_ps(y0, b1));
-                x1 = _mm_add_ps(_mm_mul_ps(x1, b0), _mm_mul_ps(y1, b1));
-                t1 = _mm_add_epi32(_mm_cvtps_epi32(x0), preshift);
-                t2 = _mm_add_epi32(_mm_cvtps_epi32(x1), preshift);
-                t1 = _mm_add_epi16(_mm_packs_epi32(t1, t2), postshift);
-
-                _mm_storeu_si128( (__m128i*)(dst + x), t0);
-                _mm_storeu_si128( (__m128i*)(dst + x + 8), t1);
-            }
-
-        for( ; x < width - 4; x += 4 )
-        {
-            __m128 x0, y0;
-            __m128i t0;
-            x0 = _mm_loadu_ps(S0 + x);
-            y0 = _mm_loadu_ps(S1 + x);
-
-            x0 = _mm_add_ps(_mm_mul_ps(x0, b0), _mm_mul_ps(y0, b1));
-            t0 = _mm_add_epi32(_mm_cvtps_epi32(x0), preshift);
-            t0 = _mm_add_epi16(_mm_packs_epi32(t0, t0), postshift);
-            _mm_storel_epi64( (__m128i*)(dst + x), t0);
-        }
-
-        return x;
-    }
-};
-
-typedef VResizeLinearVec_32f16<SHRT_MIN> VResizeLinearVec_32f16u;
-typedef VResizeLinearVec_32f16<0> VResizeLinearVec_32f16s;
-
-struct VResizeLinearVec_32f
-{
-    int operator()(const uchar** _src, uchar* _dst, const uchar* _beta, int width ) const
-    {
-        if( !checkHardwareSupport(CV_CPU_SSE) )
-            return 0;
-
-        const float** src = (const float**)_src;
-        const float* beta = (const float*)_beta;
-        const float *S0 = src[0], *S1 = src[1];
-        float* dst = (float*)_dst;
-        int x = 0;
-
-        __m128 b0 = _mm_set1_ps(beta[0]), b1 = _mm_set1_ps(beta[1]);
-
-        if( (((size_t)S0|(size_t)S1)&15) == 0 )
-            for( ; x <= width - 8; x += 8 )
-            {
-                __m128 x0, x1, y0, y1;
-                x0 = _mm_load_ps(S0 + x);
-                x1 = _mm_load_ps(S0 + x + 4);
-                y0 = _mm_load_ps(S1 + x);
-                y1 = _mm_load_ps(S1 + x + 4);
-
-                x0 = _mm_add_ps(_mm_mul_ps(x0, b0), _mm_mul_ps(y0, b1));
-                x1 = _mm_add_ps(_mm_mul_ps(x1, b0), _mm_mul_ps(y1, b1));
-
-                _mm_storeu_ps( dst + x, x0);
-                _mm_storeu_ps( dst + x + 4, x1);
-            }
-        else
-            for( ; x <= width - 8; x += 8 )
-            {
-                __m128 x0, x1, y0, y1;
-                x0 = _mm_loadu_ps(S0 + x);
-                x1 = _mm_loadu_ps(S0 + x + 4);
-                y0 = _mm_loadu_ps(S1 + x);
-                y1 = _mm_loadu_ps(S1 + x + 4);
-
-                x0 = _mm_add_ps(_mm_mul_ps(x0, b0), _mm_mul_ps(y0, b1));
-                x1 = _mm_add_ps(_mm_mul_ps(x1, b0), _mm_mul_ps(y1, b1));
-
-                _mm_storeu_ps( dst + x, x0);
-                _mm_storeu_ps( dst + x + 4, x1);
-            }
-
-        return x;
-    }
-};
-
-
-struct VResizeCubicVec_32s8u
-{
-    int operator()(const uchar** _src, uchar* dst, const uchar* _beta, int width ) const
-    {
-        if( !checkHardwareSupport(CV_CPU_SSE2) )
-            return 0;
-
-        const int** src = (const int**)_src;
-        const short* beta = (const short*)_beta;
-        const int *S0 = src[0], *S1 = src[1], *S2 = src[2], *S3 = src[3];
-        int x = 0;
-        float scale = 1.f/(INTER_RESIZE_COEF_SCALE*INTER_RESIZE_COEF_SCALE);
-        __m128 b0 = _mm_set1_ps(beta[0]*scale), b1 = _mm_set1_ps(beta[1]*scale),
-            b2 = _mm_set1_ps(beta[2]*scale), b3 = _mm_set1_ps(beta[3]*scale);
-
-        if( (((size_t)S0|(size_t)S1|(size_t)S2|(size_t)S3)&15) == 0 )
-            for( ; x <= width - 8; x += 8 )
-            {
-                __m128i x0, x1, y0, y1;
-                __m128 s0, s1, f0, f1;
-                x0 = _mm_load_si128((const __m128i*)(S0 + x));
-                x1 = _mm_load_si128((const __m128i*)(S0 + x + 4));
-                y0 = _mm_load_si128((const __m128i*)(S1 + x));
-                y1 = _mm_load_si128((const __m128i*)(S1 + x + 4));
-
-                s0 = _mm_mul_ps(_mm_cvtepi32_ps(x0), b0);
-                s1 = _mm_mul_ps(_mm_cvtepi32_ps(x1), b0);
-                f0 = _mm_mul_ps(_mm_cvtepi32_ps(y0), b1);
-                f1 = _mm_mul_ps(_mm_cvtepi32_ps(y1), b1);
-                s0 = _mm_add_ps(s0, f0);
-                s1 = _mm_add_ps(s1, f1);
-
-                x0 = _mm_load_si128((const __m128i*)(S2 + x));
-                x1 = _mm_load_si128((const __m128i*)(S2 + x + 4));
-                y0 = _mm_load_si128((const __m128i*)(S3 + x));
-                y1 = _mm_load_si128((const __m128i*)(S3 + x + 4));
-
-                f0 = _mm_mul_ps(_mm_cvtepi32_ps(x0), b2);
-                f1 = _mm_mul_ps(_mm_cvtepi32_ps(x1), b2);
-                s0 = _mm_add_ps(s0, f0);
-                s1 = _mm_add_ps(s1, f1);
-                f0 = _mm_mul_ps(_mm_cvtepi32_ps(y0), b3);
-                f1 = _mm_mul_ps(_mm_cvtepi32_ps(y1), b3);
-                s0 = _mm_add_ps(s0, f0);
-                s1 = _mm_add_ps(s1, f1);
-
-                x0 = _mm_cvtps_epi32(s0);
-                x1 = _mm_cvtps_epi32(s1);
-
-                x0 = _mm_packs_epi32(x0, x1);
-                _mm_storel_epi64( (__m128i*)(dst + x), _mm_packus_epi16(x0, x0));
-            }
-        else
-            for( ; x <= width - 8; x += 8 )
-            {
-                __m128i x0, x1, y0, y1;
-                __m128 s0, s1, f0, f1;
-                x0 = _mm_loadu_si128((const __m128i*)(S0 + x));
-                x1 = _mm_loadu_si128((const __m128i*)(S0 + x + 4));
-                y0 = _mm_loadu_si128((const __m128i*)(S1 + x));
-                y1 = _mm_loadu_si128((const __m128i*)(S1 + x + 4));
-
-                s0 = _mm_mul_ps(_mm_cvtepi32_ps(x0), b0);
-                s1 = _mm_mul_ps(_mm_cvtepi32_ps(x1), b0);
-                f0 = _mm_mul_ps(_mm_cvtepi32_ps(y0), b1);
-                f1 = _mm_mul_ps(_mm_cvtepi32_ps(y1), b1);
-                s0 = _mm_add_ps(s0, f0);
-                s1 = _mm_add_ps(s1, f1);
-
-                x0 = _mm_loadu_si128((const __m128i*)(S2 + x));
-                x1 = _mm_loadu_si128((const __m128i*)(S2 + x + 4));
-                y0 = _mm_loadu_si128((const __m128i*)(S3 + x));
-                y1 = _mm_loadu_si128((const __m128i*)(S3 + x + 4));
-
-                f0 = _mm_mul_ps(_mm_cvtepi32_ps(x0), b2);
-                f1 = _mm_mul_ps(_mm_cvtepi32_ps(x1), b2);
-                s0 = _mm_add_ps(s0, f0);
-                s1 = _mm_add_ps(s1, f1);
-                f0 = _mm_mul_ps(_mm_cvtepi32_ps(y0), b3);
-                f1 = _mm_mul_ps(_mm_cvtepi32_ps(y1), b3);
-                s0 = _mm_add_ps(s0, f0);
-                s1 = _mm_add_ps(s1, f1);
-
-                x0 = _mm_cvtps_epi32(s0);
-                x1 = _mm_cvtps_epi32(s1);
-
-                x0 = _mm_packs_epi32(x0, x1);
-                _mm_storel_epi64( (__m128i*)(dst + x), _mm_packus_epi16(x0, x0));
-            }
-
-        return x;
-    }
-};
-
-
-template<int shiftval> struct VResizeCubicVec_32f16
-{
-    int operator()(const uchar** _src, uchar* _dst, const uchar* _beta, int width ) const
-    {
-        if( !checkHardwareSupport(CV_CPU_SSE2) )
-            return 0;
-
-        const float** src = (const float**)_src;
-        const float* beta = (const float*)_beta;
-        const float *S0 = src[0], *S1 = src[1], *S2 = src[2], *S3 = src[3];
-        ushort* dst = (ushort*)_dst;
-        int x = 0;
-        __m128 b0 = _mm_set1_ps(beta[0]), b1 = _mm_set1_ps(beta[1]),
-            b2 = _mm_set1_ps(beta[2]), b3 = _mm_set1_ps(beta[3]);
-        __m128i preshift = _mm_set1_epi32(shiftval);
-        __m128i postshift = _mm_set1_epi16((short)shiftval);
-
-        for( ; x <= width - 8; x += 8 )
-        {
-            __m128 x0, x1, y0, y1, s0, s1;
-            __m128i t0, t1;
-            x0 = _mm_loadu_ps(S0 + x);
-            x1 = _mm_loadu_ps(S0 + x + 4);
-            y0 = _mm_loadu_ps(S1 + x);
-            y1 = _mm_loadu_ps(S1 + x + 4);
-
-            s0 = _mm_mul_ps(x0, b0);
-            s1 = _mm_mul_ps(x1, b0);
-            y0 = _mm_mul_ps(y0, b1);
-            y1 = _mm_mul_ps(y1, b1);
-            s0 = _mm_add_ps(s0, y0);
-            s1 = _mm_add_ps(s1, y1);
-
-            x0 = _mm_loadu_ps(S2 + x);
-            x1 = _mm_loadu_ps(S2 + x + 4);
-            y0 = _mm_loadu_ps(S3 + x);
-            y1 = _mm_loadu_ps(S3 + x + 4);
-
-            x0 = _mm_mul_ps(x0, b2);
-            x1 = _mm_mul_ps(x1, b2);
-            y0 = _mm_mul_ps(y0, b3);
-            y1 = _mm_mul_ps(y1, b3);
-            s0 = _mm_add_ps(s0, x0);
-            s1 = _mm_add_ps(s1, x1);
-            s0 = _mm_add_ps(s0, y0);
-            s1 = _mm_add_ps(s1, y1);
-
-            t0 = _mm_add_epi32(_mm_cvtps_epi32(s0), preshift);
-            t1 = _mm_add_epi32(_mm_cvtps_epi32(s1), preshift);
-
-            t0 = _mm_add_epi16(_mm_packs_epi32(t0, t1), postshift);
-            _mm_storeu_si128( (__m128i*)(dst + x), t0);
-        }
-
-        return x;
-    }
-};
-
-typedef VResizeCubicVec_32f16<SHRT_MIN> VResizeCubicVec_32f16u;
-typedef VResizeCubicVec_32f16<0> VResizeCubicVec_32f16s;
-
-struct VResizeCubicVec_32f
-{
-    int operator()(const uchar** _src, uchar* _dst, const uchar* _beta, int width ) const
-    {
-        if( !checkHardwareSupport(CV_CPU_SSE) )
-            return 0;
-
-        const float** src = (const float**)_src;
-        const float* beta = (const float*)_beta;
-        const float *S0 = src[0], *S1 = src[1], *S2 = src[2], *S3 = src[3];
-        float* dst = (float*)_dst;
-        int x = 0;
-        __m128 b0 = _mm_set1_ps(beta[0]), b1 = _mm_set1_ps(beta[1]),
-            b2 = _mm_set1_ps(beta[2]), b3 = _mm_set1_ps(beta[3]);
-
-        for( ; x <= width - 8; x += 8 )
-        {
-            __m128 x0, x1, y0, y1, s0, s1;
-            x0 = _mm_loadu_ps(S0 + x);
-            x1 = _mm_loadu_ps(S0 + x + 4);
-            y0 = _mm_loadu_ps(S1 + x);
-            y1 = _mm_loadu_ps(S1 + x + 4);
-
-            s0 = _mm_mul_ps(x0, b0);
-            s1 = _mm_mul_ps(x1, b0);
-            y0 = _mm_mul_ps(y0, b1);
-            y1 = _mm_mul_ps(y1, b1);
-            s0 = _mm_add_ps(s0, y0);
-            s1 = _mm_add_ps(s1, y1);
-
-            x0 = _mm_loadu_ps(S2 + x);
-            x1 = _mm_loadu_ps(S2 + x + 4);
-            y0 = _mm_loadu_ps(S3 + x);
-            y1 = _mm_loadu_ps(S3 + x + 4);
-
-            x0 = _mm_mul_ps(x0, b2);
-            x1 = _mm_mul_ps(x1, b2);
-            y0 = _mm_mul_ps(y0, b3);
-            y1 = _mm_mul_ps(y1, b3);
-            s0 = _mm_add_ps(s0, x0);
-            s1 = _mm_add_ps(s1, x1);
-            s0 = _mm_add_ps(s0, y0);
-            s1 = _mm_add_ps(s1, y1);
-
-            _mm_storeu_ps( dst + x, s0);
-            _mm_storeu_ps( dst + x + 4, s1);
-        }
-
-        return x;
-    }
-};
-
-#else
-
-typedef VResizeNoVec VResizeLinearVec_32s8u;
-typedef VResizeNoVec VResizeLinearVec_32f16u;
-typedef VResizeNoVec VResizeLinearVec_32f16s;
-typedef VResizeNoVec VResizeLinearVec_32f;
-
-typedef VResizeNoVec VResizeCubicVec_32s8u;
-typedef VResizeNoVec VResizeCubicVec_32f16u;
-typedef VResizeNoVec VResizeCubicVec_32f16s;
-typedef VResizeNoVec VResizeCubicVec_32f;
-
-#endif
-
-typedef HResizeNoVec HResizeLinearVec_8u32s;
-typedef HResizeNoVec HResizeLinearVec_16u32f;
-typedef HResizeNoVec HResizeLinearVec_16s32f;
-typedef HResizeNoVec HResizeLinearVec_32f;
-typedef HResizeNoVec HResizeLinearVec_64f;
-
-
-template<typename T, typename WT, typename AT, int ONE, class VecOp>
-struct HResizeLinear
-{
-    typedef T value_type;
-    typedef WT buf_type;
-    typedef AT alpha_type;
-
-    void operator()(const T** src, WT** dst, int count,
-                    const int* xofs, const AT* alpha,
-                    int swidth, int dwidth, int cn, int xmin, int xmax ) const
-    {
-        int dx, k;
-        VecOp vecOp;
-
-        int dx0 = vecOp((const uchar**)src, (uchar**)dst, count,
-            xofs, (const uchar*)alpha, swidth, dwidth, cn, xmin, xmax );
-
-        for( k = 0; k <= count - 2; k++ )
-        {
-            const T *S0 = src[k], *S1 = src[k+1];
-            WT *D0 = dst[k], *D1 = dst[k+1];
-            for( dx = dx0; dx < xmax; dx++ )
-            {
-                int sx = xofs[dx];
-                WT a0 = alpha[dx*2], a1 = alpha[dx*2+1];
-                WT t0 = S0[sx]*a0 + S0[sx + cn]*a1;
-                WT t1 = S1[sx]*a0 + S1[sx + cn]*a1;
-                D0[dx] = t0; D1[dx] = t1;
-            }
-
-            for( ; dx < dwidth; dx++ )
-            {
-                int sx = xofs[dx];
-                D0[dx] = WT(S0[sx]*ONE); D1[dx] = WT(S1[sx]*ONE);
-            }
-        }
-
-        for( ; k < count; k++ )
-        {
-            const T *S = src[k];
-            WT *D = dst[k];
-            for( dx = 0; dx < xmax; dx++ )
-            {
-                int sx = xofs[dx];
-                D[dx] = S[sx]*alpha[dx*2] + S[sx+cn]*alpha[dx*2+1];
-            }
-
-            for( ; dx < dwidth; dx++ )
-                D[dx] = WT(S[xofs[dx]]*ONE);
-        }
-    }
-};
-
-
-template<typename T, typename WT, typename AT, class CastOp, class VecOp>
-struct VResizeLinear
-{
-    typedef T value_type;
-    typedef WT buf_type;
-    typedef AT alpha_type;
-
-    void operator()(const WT** src, T* dst, const AT* beta, int width ) const
-    {
-        WT b0 = beta[0], b1 = beta[1];
-        const WT *S0 = src[0], *S1 = src[1];
-        CastOp castOp;
-        VecOp vecOp;
-
-        int x = vecOp((const uchar**)src, (uchar*)dst, (const uchar*)beta, width);
-        #if CV_ENABLE_UNROLLED
-        for( ; x <= width - 4; x += 4 )
-        {
-            WT t0, t1;
-            t0 = S0[x]*b0 + S1[x]*b1;
-            t1 = S0[x+1]*b0 + S1[x+1]*b1;
-            dst[x] = castOp(t0); dst[x+1] = castOp(t1);
-            t0 = S0[x+2]*b0 + S1[x+2]*b1;
-            t1 = S0[x+3]*b0 + S1[x+3]*b1;
-            dst[x+2] = castOp(t0); dst[x+3] = castOp(t1);
-        }
-        #endif
-        for( ; x < width; x++ )
-            dst[x] = castOp(S0[x]*b0 + S1[x]*b1);
-    }
-};
-
-template<>
-struct VResizeLinear<uchar, int, short, FixedPtCast<int, uchar, INTER_RESIZE_COEF_BITS*2>, VResizeLinearVec_32s8u>
-{
-    typedef uchar value_type;
-    typedef int buf_type;
-    typedef short alpha_type;
-
-    void operator()(const buf_type** src, value_type* dst, const alpha_type* beta, int width ) const
-    {
-        alpha_type b0 = beta[0], b1 = beta[1];
-        const buf_type *S0 = src[0], *S1 = src[1];
-        VResizeLinearVec_32s8u vecOp;
-
-        int x = vecOp((const uchar**)src, (uchar*)dst, (const uchar*)beta, width);
-        #if CV_ENABLE_UNROLLED
-        for( ; x <= width - 4; x += 4 )
-        {
-            dst[x+0] = uchar(( ((b0 * (S0[x+0] >> 4)) >> 16) + ((b1 * (S1[x+0] >> 4)) >> 16) + 2)>>2);
-            dst[x+1] = uchar(( ((b0 * (S0[x+1] >> 4)) >> 16) + ((b1 * (S1[x+1] >> 4)) >> 16) + 2)>>2);
-            dst[x+2] = uchar(( ((b0 * (S0[x+2] >> 4)) >> 16) + ((b1 * (S1[x+2] >> 4)) >> 16) + 2)>>2);
-            dst[x+3] = uchar(( ((b0 * (S0[x+3] >> 4)) >> 16) + ((b1 * (S1[x+3] >> 4)) >> 16) + 2)>>2);
-        }
-        #endif
-        for( ; x < width; x++ )
-            dst[x] = uchar(( ((b0 * (S0[x] >> 4)) >> 16) + ((b1 * (S1[x] >> 4)) >> 16) + 2)>>2);
-    }
-};
-
-
-template<typename T, typename WT, typename AT>
-struct HResizeCubic
-{
-    typedef T value_type;
-    typedef WT buf_type;
-    typedef AT alpha_type;
-
-    void operator()(const T** src, WT** dst, int count,
-                    const int* xofs, const AT* alpha,
-                    int swidth, int dwidth, int cn, int xmin, int xmax ) const
-    {
-        for( int k = 0; k < count; k++ )
-        {
-            const T *S = src[k];
-            WT *D = dst[k];
-            int dx = 0, limit = xmin;
-            for(;;)
-            {
-                for( ; dx < limit; dx++, alpha += 4 )
-                {
-                    int j, sx = xofs[dx] - cn;
-                    WT v = 0;
-                    for( j = 0; j < 4; j++ )
-                    {
-                        int sxj = sx + j*cn;
-                        if( (unsigned)sxj >= (unsigned)swidth )
-                        {
-                            while( sxj < 0 )
-                                sxj += cn;
-                            while( sxj >= swidth )
-                                sxj -= cn;
-                        }
-                        v += S[sxj]*alpha[j];
-                    }
-                    D[dx] = v;
-                }
-                if( limit == dwidth )
-                    break;
-                for( ; dx < xmax; dx++, alpha += 4 )
-                {
-                    int sx = xofs[dx];
-                    D[dx] = S[sx-cn]*alpha[0] + S[sx]*alpha[1] +
-                        S[sx+cn]*alpha[2] + S[sx+cn*2]*alpha[3];
-                }
-                limit = dwidth;
-            }
-            alpha -= dwidth*4;
-        }
-    }
-};
-
-
-template<typename T, typename WT, typename AT, class CastOp, class VecOp>
-struct VResizeCubic
-{
-    typedef T value_type;
-    typedef WT buf_type;
-    typedef AT alpha_type;
-
-    void operator()(const WT** src, T* dst, const AT* beta, int width ) const
-    {
-        WT b0 = beta[0], b1 = beta[1], b2 = beta[2], b3 = beta[3];
-        const WT *S0 = src[0], *S1 = src[1], *S2 = src[2], *S3 = src[3];
-        CastOp castOp;
-        VecOp vecOp;
-
-        int x = vecOp((const uchar**)src, (uchar*)dst, (const uchar*)beta, width);
-        for( ; x < width; x++ )
-            dst[x] = castOp(S0[x]*b0 + S1[x]*b1 + S2[x]*b2 + S3[x]*b3);
-    }
-};
-
-
-template<typename T, typename WT, typename AT>
-struct HResizeLanczos4
-{
-    typedef T value_type;
-    typedef WT buf_type;
-    typedef AT alpha_type;
-
-    void operator()(const T** src, WT** dst, int count,
-                    const int* xofs, const AT* alpha,
-                    int swidth, int dwidth, int cn, int xmin, int xmax ) const
-    {
-        for( int k = 0; k < count; k++ )
-        {
-            const T *S = src[k];
-            WT *D = dst[k];
-            int dx = 0, limit = xmin;
-            for(;;)
-            {
-                for( ; dx < limit; dx++, alpha += 8 )
-                {
-                    int j, sx = xofs[dx] - cn*3;
-                    WT v = 0;
-                    for( j = 0; j < 8; j++ )
-                    {
-                        int sxj = sx + j*cn;
-                        if( (unsigned)sxj >= (unsigned)swidth )
-                        {
-                            while( sxj < 0 )
-                                sxj += cn;
-                            while( sxj >= swidth )
-                                sxj -= cn;
-                        }
-                        v += S[sxj]*alpha[j];
-                    }
-                    D[dx] = v;
-                }
-                if( limit == dwidth )
-                    break;
-                for( ; dx < xmax; dx++, alpha += 8 )
-                {
-                    int sx = xofs[dx];
-                    D[dx] = S[sx-cn*3]*alpha[0] + S[sx-cn*2]*alpha[1] +
-                        S[sx-cn]*alpha[2] + S[sx]*alpha[3] +
-                        S[sx+cn]*alpha[4] + S[sx+cn*2]*alpha[5] +
-                        S[sx+cn*3]*alpha[6] + S[sx+cn*4]*alpha[7];
-                }
-                limit = dwidth;
-            }
-            alpha -= dwidth*8;
-        }
-    }
-};
-
-
-template<typename T, typename WT, typename AT, class CastOp, class VecOp>
-struct VResizeLanczos4
-{
-    typedef T value_type;
-    typedef WT buf_type;
-    typedef AT alpha_type;
-
-    void operator()(const WT** src, T* dst, const AT* beta, int width ) const
-    {
-        CastOp castOp;
-        VecOp vecOp;
-        int k, x = vecOp((const uchar**)src, (uchar*)dst, (const uchar*)beta, width);
-        #if CV_ENABLE_UNROLLED
-        for( ; x <= width - 4; x += 4 )
-        {
-            WT b = beta[0];
-            const WT* S = src[0];
-            WT s0 = S[x]*b, s1 = S[x+1]*b, s2 = S[x+2]*b, s3 = S[x+3]*b;
-
-            for( k = 1; k < 8; k++ )
-            {
-                b = beta[k]; S = src[k];
-                s0 += S[x]*b; s1 += S[x+1]*b;
-                s2 += S[x+2]*b; s3 += S[x+3]*b;
-            }
-
-            dst[x] = castOp(s0); dst[x+1] = castOp(s1);
-            dst[x+2] = castOp(s2); dst[x+3] = castOp(s3);
-        }
-        #endif
-        for( ; x < width; x++ )
-        {
-            dst[x] = castOp(src[0][x]*beta[0] + src[1][x]*beta[1] +
-                src[2][x]*beta[2] + src[3][x]*beta[3] + src[4][x]*beta[4] +
-                src[5][x]*beta[5] + src[6][x]*beta[6] + src[7][x]*beta[7]);
-        }
-    }
-};
-
-
 static inline int clip(int x, int a, int b)
 {
     return x >= a ? (x < b ? x : b-1) : a;
 }
 
-static const int MAX_ESIZE=16;
-
-template <typename HResize, typename VResize>
-class resizeGeneric_Invoker :
-    public ParallelLoopBody
-{
-public:
-    typedef typename HResize::value_type T;
-    typedef typename HResize::buf_type WT;
-    typedef typename HResize::alpha_type AT;
-
-    resizeGeneric_Invoker(const Mat& _src, Mat &_dst, const int *_xofs, const int *_yofs,
-        const AT* _alpha, const AT* __beta, const Size& _ssize, const Size &_dsize,
-        int _ksize, int _xmin, int _xmax) :
-        ParallelLoopBody(), src(_src), dst(_dst), xofs(_xofs), yofs(_yofs),
-        alpha(_alpha), _beta(__beta), ssize(_ssize), dsize(_dsize),
-        ksize(_ksize), xmin(_xmin), xmax(_xmax)
-    {
-    }
-
-    virtual void operator() (const Range& range) const
-    {
-        int dy, cn = src.channels();
-        HResize hresize;
-        VResize vresize;
-
-        int bufstep = (int)alignSize(dsize.width, 16);
-        AutoBuffer<WT> _buffer(bufstep*ksize);
-        const T* srows[MAX_ESIZE]={0};
-        WT* rows[MAX_ESIZE]={0};
-        int prev_sy[MAX_ESIZE];
-
-        for(int k = 0; k < ksize; k++ )
-        {
-            prev_sy[k] = -1;
-            rows[k] = (WT*)_buffer + bufstep*k;
-        }
-
-        const AT* beta = _beta + ksize * range.start;
-
-        for( dy = range.start; dy < range.end; dy++, beta += ksize )
-        {
-            int sy0 = yofs[dy], k0=ksize, k1=0, ksize2 = ksize/2;
-
-            for(int k = 0; k < ksize; k++ )
-            {
-                int sy = clip(sy0 - ksize2 + 1 + k, 0, ssize.height);
-                for( k1 = std::max(k1, k); k1 < ksize; k1++ )
-                {
-                    if( sy == prev_sy[k1] ) // if the sy-th row has been computed already, reuse it.
-                    {
-                        if( k1 > k )
-                            memcpy( rows[k], rows[k1], bufstep*sizeof(rows[0][0]) );
-                        break;
-                    }
-                }
-                if( k1 == ksize )
-                    k0 = std::min(k0, k); // remember the first row that needs to be computed
-                srows[k] = (T*)(src.data + src.step*sy);
-                prev_sy[k] = sy;
-            }
-
-            if( k0 < ksize )
-                hresize( (const T**)(srows + k0), (WT**)(rows + k0), ksize - k0, xofs, (const AT*)(alpha),
-                        ssize.width, dsize.width, cn, xmin, xmax );
-            vresize( (const WT**)rows, (T*)(dst.data + dst.step*dy), beta, dsize.width );
-        }
-    }
-
-private:
-    Mat src;
-    Mat dst;
-    const int* xofs, *yofs;
-    const AT* alpha, *_beta;
-    Size ssize, dsize;
-    int ksize, xmin, xmax;
-};
-
-template<class HResize, class VResize>
-static void resizeGeneric_( const Mat& src, Mat& dst,
-                            const int* xofs, const void* _alpha,
-                            const int* yofs, const void* _beta,
-                            int xmin, int xmax, int ksize )
-{
-    typedef typename HResize::value_type T;
-    typedef typename HResize::buf_type WT;
-    typedef typename HResize::alpha_type AT;
-
-    const AT* beta = (const AT*)_beta;
-    Size ssize = src.size(), dsize = dst.size();
-    int cn = src.channels();
-    ssize.width *= cn;
-    dsize.width *= cn;
-    xmin *= cn;
-    xmax *= cn;
-    // image resize is a separable operation. In case of not too strong
-
-    Range range(0, dsize.height);
-    resizeGeneric_Invoker<HResize, VResize> invoker(src, dst, xofs, yofs, (const AT*)_alpha, beta,
-        ssize, dsize, ksize, xmin, xmax);
-    parallel_for_(range, invoker, dst.total()/(double)(1<<16));
-}
-
-template <typename T, typename WT>
-struct ResizeAreaFastNoVec
-{
-    ResizeAreaFastNoVec(int /*_scale_x*/, int /*_scale_y*/,
-        int /*_cn*/, int /*_step*//*, const int**/ /*_ofs*/) { }
-    int operator() (const T* /*S*/, T* /*D*/, int /*w*/) const { return 0; }
-};
-
-template<typename T>
-struct ResizeAreaFastVec
-{
-    ResizeAreaFastVec(int _scale_x, int _scale_y, int _cn, int _step/*, const int* _ofs*/) :
-        scale_x(_scale_x), scale_y(_scale_y), cn(_cn), step(_step)/*, ofs(_ofs)*/
-    {
-        fast_mode = scale_x == 2 && scale_y == 2 && (cn == 1 || cn == 3 || cn == 4);
-    }
-
-    int operator() (const T* S, T* D, int w) const
-    {
-        if( !fast_mode )
-            return 0;
-
-        const T* nextS = (const T*)((const uchar*)S + step);
-        int dx = 0;
-
-        if (cn == 1)
-            for( ; dx < w; ++dx )
-            {
-                int index = dx*2;
-                D[dx] = (T)((S[index] + S[index+1] + nextS[index] + nextS[index+1] + 2) >> 2);
-            }
-        else if (cn == 3)
-            for( ; dx < w; dx += 3 )
-            {
-                int index = dx*2;
-                D[dx] = (T)((S[index] + S[index+3] + nextS[index] + nextS[index+3] + 2) >> 2);
-                D[dx+1] = (T)((S[index+1] + S[index+4] + nextS[index+1] + nextS[index+4] + 2) >> 2);
-                D[dx+2] = (T)((S[index+2] + S[index+5] + nextS[index+2] + nextS[index+5] + 2) >> 2);
-            }
-        else
-            {
-                assert(cn == 4);
-                for( ; dx < w; dx += 4 )
-                {
-                    int index = dx*2;
-                    D[dx] = (T)((S[index] + S[index+4] + nextS[index] + nextS[index+4] + 2) >> 2);
-                    D[dx+1] = (T)((S[index+1] + S[index+5] + nextS[index+1] + nextS[index+5] + 2) >> 2);
-                    D[dx+2] = (T)((S[index+2] + S[index+6] + nextS[index+2] + nextS[index+6] + 2) >> 2);
-                    D[dx+3] = (T)((S[index+3] + S[index+7] + nextS[index+3] + nextS[index+7] + 2) >> 2);
-                }
-            }
-
-        return dx;
-    }
-
-private:
-    int scale_x, scale_y;
-    int cn;
-    bool fast_mode;
-    int step;
-};
-
-template <typename T, typename WT, typename VecOp>
-class resizeAreaFast_Invoker :
-    public ParallelLoopBody
-{
-public:
-    resizeAreaFast_Invoker(const Mat &_src, Mat &_dst,
-        int _scale_x, int _scale_y, const int* _ofs, const int* _xofs) :
-        ParallelLoopBody(), src(_src), dst(_dst), scale_x(_scale_x),
-        scale_y(_scale_y), ofs(_ofs), xofs(_xofs)
-    {
-    }
-
-    virtual void operator() (const Range& range) const
-    {
-        Size ssize = src.size(), dsize = dst.size();
-        int cn = src.channels();
-        int area = scale_x*scale_y;
-        float scale = 1.f/(area);
-        int dwidth1 = (ssize.width/scale_x)*cn;
-        dsize.width *= cn;
-        ssize.width *= cn;
-        int dy, dx, k = 0;
-
-        VecOp vop(scale_x, scale_y, src.channels(), (int)src.step/*, area_ofs*/);
-
-        for( dy = range.start; dy < range.end; dy++ )
-        {
-            T* D = (T*)(dst.data + dst.step*dy);
-            int sy0 = dy*scale_y;
-            int w = sy0 + scale_y <= ssize.height ? dwidth1 : 0;
-
-            if( sy0 >= ssize.height )
-            {
-                for( dx = 0; dx < dsize.width; dx++ )
-                    D[dx] = 0;
-                continue;
-            }
-
-            dx = vop((const T*)(src.data + src.step * sy0), D, w);
-            for( ; dx < w; dx++ )
-            {
-                const T* S = (const T*)(src.data + src.step * sy0) + xofs[dx];
-                WT sum = 0;
-                k = 0;
-                #if CV_ENABLE_UNROLLED
-                for( ; k <= area - 4; k += 4 )
-                    sum += S[ofs[k]] + S[ofs[k+1]] + S[ofs[k+2]] + S[ofs[k+3]];
-                #endif
-                for( ; k < area; k++ )
-                    sum += S[ofs[k]];
-
-                D[dx] = saturate_cast<T>(sum * scale);
-            }
-
-            for( ; dx < dsize.width; dx++ )
-            {
-                WT sum = 0;
-                int count = 0, sx0 = xofs[dx];
-                if( sx0 >= ssize.width )
-                    D[dx] = 0;
-
-                for( int sy = 0; sy < scale_y; sy++ )
-                {
-                    if( sy0 + sy >= ssize.height )
-                        break;
-                    const T* S = (const T*)(src.data + src.step*(sy0 + sy)) + sx0;
-                    for( int sx = 0; sx < scale_x*cn; sx += cn )
-                    {
-                        if( sx0 + sx >= ssize.width )
-                            break;
-                        sum += S[sx];
-                        count++;
-                    }
-                }
-
-                D[dx] = saturate_cast<T>((float)sum/count);
-            }
-        }
-    }
-
-private:
-    Mat src;
-    Mat dst;
-    int scale_x, scale_y;
-    const int *ofs, *xofs;
-};
-
-template<typename T, typename WT, typename VecOp>
-static void resizeAreaFast_( const Mat& src, Mat& dst, const int* ofs, const int* xofs,
-                             int scale_x, int scale_y )
-{
-    Range range(0, dst.rows);
-    resizeAreaFast_Invoker<T, WT, VecOp> invoker(src, dst, scale_x,
-        scale_y, ofs, xofs);
-    parallel_for_(range, invoker, dst.total()/(double)(1<<16));
-}
-
-struct DecimateAlpha
-{
-    int si, di;
-    float alpha;
-};
-
-
-template<typename T, typename WT> class ResizeArea_Invoker :
-    public ParallelLoopBody
-{
-public:
-    ResizeArea_Invoker( const Mat& _src, Mat& _dst,
-                        const DecimateAlpha* _xtab, int _xtab_size,
-                        const DecimateAlpha* _ytab, int _ytab_size,
-                        const int* _tabofs )
-    {
-        src = &_src;
-        dst = &_dst;
-        xtab0 = _xtab;
-        xtab_size0 = _xtab_size;
-        ytab = _ytab;
-        ytab_size = _ytab_size;
-        tabofs = _tabofs;
-    }
-
-    virtual void operator() (const Range& range) const
-    {
-        Size dsize = dst->size();
-        int cn = dst->channels();
-        dsize.width *= cn;
-        AutoBuffer<WT> _buffer(dsize.width*2);
-        const DecimateAlpha* xtab = xtab0;
-        int xtab_size = xtab_size0;
-        WT *buf = _buffer, *sum = buf + dsize.width;
-        int j_start = tabofs[range.start], j_end = tabofs[range.end], j, k, dx, prev_dy = ytab[j_start].di;
-
-        for( dx = 0; dx < dsize.width; dx++ )
-            sum[dx] = (WT)0;
-
-        for( j = j_start; j < j_end; j++ )
-        {
-            WT beta = ytab[j].alpha;
-            int dy = ytab[j].di;
-            int sy = ytab[j].si;
-
-            {
-                const T* S = (const T*)(src->data + src->step*sy);
-                for( dx = 0; dx < dsize.width; dx++ )
-                    buf[dx] = (WT)0;
-
-                if( cn == 1 )
-                    for( k = 0; k < xtab_size; k++ )
-                    {
-                        int dxn = xtab[k].di;
-                        WT alpha = xtab[k].alpha;
-                        buf[dxn] += S[xtab[k].si]*alpha;
-                    }
-                else if( cn == 2 )
-                    for( k = 0; k < xtab_size; k++ )
-                    {
-                        int sxn = xtab[k].si;
-                        int dxn = xtab[k].di;
-                        WT alpha = xtab[k].alpha;
-                        WT t0 = buf[dxn] + S[sxn]*alpha;
-                        WT t1 = buf[dxn+1] + S[sxn+1]*alpha;
-                        buf[dxn] = t0; buf[dxn+1] = t1;
-                    }
-                else if( cn == 3 )
-                    for( k = 0; k < xtab_size; k++ )
-                    {
-                        int sxn = xtab[k].si;
-                        int dxn = xtab[k].di;
-                        WT alpha = xtab[k].alpha;
-                        WT t0 = buf[dxn] + S[sxn]*alpha;
-                        WT t1 = buf[dxn+1] + S[sxn+1]*alpha;
-                        WT t2 = buf[dxn+2] + S[sxn+2]*alpha;
-                        buf[dxn] = t0; buf[dxn+1] = t1; buf[dxn+2] = t2;
-                    }
-                else if( cn == 4 )
-                {
-                    for( k = 0; k < xtab_size; k++ )
-                    {
-                        int sxn = xtab[k].si;
-                        int dxn = xtab[k].di;
-                        WT alpha = xtab[k].alpha;
-                        WT t0 = buf[dxn] + S[sxn]*alpha;
-                        WT t1 = buf[dxn+1] + S[sxn+1]*alpha;
-                        buf[dxn] = t0; buf[dxn+1] = t1;
-                        t0 = buf[dxn+2] + S[sxn+2]*alpha;
-                        t1 = buf[dxn+3] + S[sxn+3]*alpha;
-                        buf[dxn+2] = t0; buf[dxn+3] = t1;
-                    }
-                }
-                else
-                {
-                    for( k = 0; k < xtab_size; k++ )
-                    {
-                        int sxn = xtab[k].si;
-                        int dxn = xtab[k].di;
-                        WT alpha = xtab[k].alpha;
-                        for( int c = 0; c < cn; c++ )
-                            buf[dxn + c] += S[sxn + c]*alpha;
-                    }
-                }
-            }
-
-            if( dy != prev_dy )
-            {
-                T* D = (T*)(dst->data + dst->step*prev_dy);
-
-                for( dx = 0; dx < dsize.width; dx++ )
-                {
-                    D[dx] = saturate_cast<T>(sum[dx]);
-                    sum[dx] = beta*buf[dx];
-                }
-                prev_dy = dy;
-            }
-            else
-            {
-                for( dx = 0; dx < dsize.width; dx++ )
-                    sum[dx] += beta*buf[dx];
-            }
-        }
-
-        {
-        T* D = (T*)(dst->data + dst->step*prev_dy);
-        for( dx = 0; dx < dsize.width; dx++ )
-            D[dx] = saturate_cast<T>(sum[dx]);
-        }
-    }
-
-private:
-    const Mat* src;
-    Mat* dst;
-    const DecimateAlpha* xtab0;
-    const DecimateAlpha* ytab;
-    int xtab_size0, ytab_size;
-    const int* tabofs;
-};
-
-
-template <typename T, typename WT>
-static void resizeArea_( const Mat& src, Mat& dst,
-                         const DecimateAlpha* xtab, int xtab_size,
-                         const DecimateAlpha* ytab, int ytab_size,
-                         const int* tabofs )
-{
-    parallel_for_(Range(0, dst.rows),
-                 ResizeArea_Invoker<T, WT>(src, dst, xtab, xtab_size, ytab, ytab_size, tabofs),
-                 dst.total()/((double)(1 << 16)));
-}
-
-
-typedef void (*ResizeFunc)( const Mat& src, Mat& dst,
-                            const int* xofs, const void* alpha,
-                            const int* yofs, const void* beta,
-                            int xmin, int xmax, int ksize );
-
-typedef void (*ResizeAreaFastFunc)( const Mat& src, Mat& dst,
-                                    const int* ofs, const int *xofs,
-                                    int scale_x, int scale_y );
-
-typedef void (*ResizeAreaFunc)( const Mat& src, Mat& dst,
-                                const DecimateAlpha* xtab, int xtab_size,
-                                const DecimateAlpha* ytab, int ytab_size,
-                                const int* yofs);
-
-
-static int computeResizeAreaTab( int ssize, int dsize, int cn, double scale, DecimateAlpha* tab )
-{
-    int k = 0;
-    for(int dx = 0; dx < dsize; dx++ )
-    {
-        double fsx1 = dx * scale;
-        double fsx2 = fsx1 + scale;
-        double cellWidth = min(scale, ssize - fsx1);
-
-        int sx1 = cvCeil(fsx1), sx2 = cvFloor(fsx2);
-
-        sx2 = std::min(sx2, ssize - 1);
-        sx1 = std::min(sx1, sx2);
-
-        if( sx1 - fsx1 > 1e-3 )
-        {
-            assert( k < ssize*2 );
-            tab[k].di = dx * cn;
-            tab[k].si = (sx1 - 1) * cn;
-            tab[k++].alpha = (float)((sx1 - fsx1) / cellWidth);
-        }
-
-        for(int sx = sx1; sx < sx2; sx++ )
-        {
-            assert( k < ssize*2 );
-            tab[k].di = dx * cn;
-            tab[k].si = sx * cn;
-            tab[k++].alpha = float(1.0 / cellWidth);
-        }
-
-        if( fsx2 - sx2 > 1e-3 )
-        {
-            assert( k < ssize*2 );
-            tab[k].di = dx * cn;
-            tab[k].si = sx2 * cn;
-            tab[k++].alpha = (float)(min(min(fsx2 - sx2, 1.), cellWidth) / cellWidth);
-        }
-    }
-    return k;
-}
-
-
-}
-
-
-//////////////////////////////////////////////////////////////////////////////////////////
-
-void cv::resize( InputArray _src, OutputArray _dst, Size dsize,
-                 double inv_scale_x, double inv_scale_y, int interpolation )
-{
-    static ResizeFunc linear_tab[] =
-    {
-        resizeGeneric_<
-            HResizeLinear<uchar, int, short,
-                INTER_RESIZE_COEF_SCALE,
-                HResizeLinearVec_8u32s>,
-            VResizeLinear<uchar, int, short,
-                FixedPtCast<int, uchar, INTER_RESIZE_COEF_BITS*2>,
-                VResizeLinearVec_32s8u> >,
-        0,
-        resizeGeneric_<
-            HResizeLinear<ushort, float, float, 1,
-                HResizeLinearVec_16u32f>,
-            VResizeLinear<ushort, float, float, Cast<float, ushort>,
-                VResizeLinearVec_32f16u> >,
-        resizeGeneric_<
-            HResizeLinear<short, float, float, 1,
-                HResizeLinearVec_16s32f>,
-            VResizeLinear<short, float, float, Cast<float, short>,
-                VResizeLinearVec_32f16s> >,
-        0,
-        resizeGeneric_<
-            HResizeLinear<float, float, float, 1,
-                HResizeLinearVec_32f>,
-            VResizeLinear<float, float, float, Cast<float, float>,
-                VResizeLinearVec_32f> >,
-        resizeGeneric_<
-            HResizeLinear<double, double, float, 1,
-                HResizeNoVec>,
-            VResizeLinear<double, double, float, Cast<double, double>,
-                VResizeNoVec> >,
-        0
-    };
-
-    static ResizeFunc cubic_tab[] =
-    {
-        resizeGeneric_<
-            HResizeCubic<uchar, int, short>,
-            VResizeCubic<uchar, int, short,
-                FixedPtCast<int, uchar, INTER_RESIZE_COEF_BITS*2>,
-                VResizeCubicVec_32s8u> >,
-        0,
-        resizeGeneric_<
-            HResizeCubic<ushort, float, float>,
-            VResizeCubic<ushort, float, float, Cast<float, ushort>,
-            VResizeCubicVec_32f16u> >,
-        resizeGeneric_<
-            HResizeCubic<short, float, float>,
-            VResizeCubic<short, float, float, Cast<float, short>,
-            VResizeCubicVec_32f16s> >,
-        0,
-        resizeGeneric_<
-            HResizeCubic<float, float, float>,
-            VResizeCubic<float, float, float, Cast<float, float>,
-            VResizeCubicVec_32f> >,
-        resizeGeneric_<
-            HResizeCubic<double, double, float>,
-            VResizeCubic<double, double, float, Cast<double, double>,
-            VResizeNoVec> >,
-        0
-    };
-
-    static ResizeFunc lanczos4_tab[] =
-    {
-        resizeGeneric_<HResizeLanczos4<uchar, int, short>,
-            VResizeLanczos4<uchar, int, short,
-            FixedPtCast<int, uchar, INTER_RESIZE_COEF_BITS*2>,
-            VResizeNoVec> >,
-        0,
-        resizeGeneric_<HResizeLanczos4<ushort, float, float>,
-            VResizeLanczos4<ushort, float, float, Cast<float, ushort>,
-            VResizeNoVec> >,
-        resizeGeneric_<HResizeLanczos4<short, float, float>,
-            VResizeLanczos4<short, float, float, Cast<float, short>,
-            VResizeNoVec> >,
-        0,
-        resizeGeneric_<HResizeLanczos4<float, float, float>,
-            VResizeLanczos4<float, float, float, Cast<float, float>,
-            VResizeNoVec> >,
-        resizeGeneric_<HResizeLanczos4<double, double, float>,
-            VResizeLanczos4<double, double, float, Cast<double, double>,
-            VResizeNoVec> >,
-        0
-    };
-
-    static ResizeAreaFastFunc areafast_tab[] =
-    {
-        resizeAreaFast_<uchar, int, ResizeAreaFastVec<uchar> >,
-        0,
-        resizeAreaFast_<ushort, float, ResizeAreaFastVec<ushort> >,
-        resizeAreaFast_<short, float, ResizeAreaFastVec<short> >,
-        0,
-        resizeAreaFast_<float, float, ResizeAreaFastNoVec<float, float> >,
-        resizeAreaFast_<double, double, ResizeAreaFastNoVec<double, double> >,
-        0
-    };
-
-    static ResizeAreaFunc area_tab[] =
-    {
-        resizeArea_<uchar, float>, 0, resizeArea_<ushort, float>,
-        resizeArea_<short, float>, 0, resizeArea_<float, float>,
-        resizeArea_<double, double>, 0
-    };
-
-    Mat src = _src.getMat();
-    Size ssize = src.size();
-
-    CV_Assert( ssize.area() > 0 );
-    CV_Assert( dsize.area() || (inv_scale_x > 0 && inv_scale_y > 0) );
-    if( !dsize.area() )
-    {
-        dsize = Size(saturate_cast<int>(src.cols*inv_scale_x),
-            saturate_cast<int>(src.rows*inv_scale_y));
-        CV_Assert( dsize.area() );
-    }
-    else
-    {
-        inv_scale_x = (double)dsize.width/src.cols;
-        inv_scale_y = (double)dsize.height/src.rows;
-    }
-    _dst.create(dsize, src.type());
-    Mat dst = _dst.getMat();
-
-
-#ifdef HAVE_TEGRA_OPTIMIZATION
-    if (tegra::resize(src, dst, inv_scale_x, inv_scale_y, interpolation))
-        return;
-#endif
-
-    int depth = src.depth(), cn = src.channels();
-    double scale_x = 1./inv_scale_x, scale_y = 1./inv_scale_y;
-    int k, sx, sy, dx, dy;
-
-    if( interpolation == INTER_NEAREST )
-    {
-        resizeNN( src, dst, inv_scale_x, inv_scale_y );
-        return;
-    }
-
-    {
-        int iscale_x = saturate_cast<int>(scale_x);
-        int iscale_y = saturate_cast<int>(scale_y);
-
-        bool is_area_fast = std::abs(scale_x - iscale_x) < DBL_EPSILON &&
-                std::abs(scale_y - iscale_y) < DBL_EPSILON;
-
-        // in case of scale_x && scale_y is equal to 2
-        // INTER_AREA (fast) also is equal to INTER_LINEAR
-        if( interpolation == INTER_LINEAR && is_area_fast && iscale_x == 2 && iscale_y == 2 )
-        {
-            interpolation = INTER_AREA;
-        }
-
-        // true "area" interpolation is only implemented for the case (scale_x <= 1 && scale_y <= 1).
-        // In other cases it is emulated using some variant of bilinear interpolation
-        if( interpolation == INTER_AREA && scale_x >= 1 && scale_y >= 1 )
-        {
-            if( is_area_fast )
-            {
-                int area = iscale_x*iscale_y;
-                size_t srcstep = src.step / src.elemSize1();
-                AutoBuffer<int> _ofs(area + dsize.width*cn);
-                int* ofs = _ofs;
-                int* xofs = ofs + area;
-                ResizeAreaFastFunc func = areafast_tab[depth];
-                CV_Assert( func != 0 );
-
-                for( sy = 0, k = 0; sy < iscale_y; sy++ )
-                    for( sx = 0; sx < iscale_x; sx++ )
-                        ofs[k++] = (int)(sy*srcstep + sx*cn);
-
-                for( dx = 0; dx < dsize.width; dx++ )
-                {
-                    int j = dx * cn;
-                    sx = iscale_x * j;
-                    for( k = 0; k < cn; k++ )
-                        xofs[j + k] = sx + k;
-                }
-
-                func( src, dst, ofs, xofs, iscale_x, iscale_y );
-                return;
-            }
-
-            ResizeAreaFunc func = area_tab[depth];
-            CV_Assert( func != 0 && cn <= 4 );
-
-            AutoBuffer<DecimateAlpha> _xytab((ssize.width + ssize.height)*2);
-            DecimateAlpha* xtab = _xytab, *ytab = xtab + ssize.width*2;
-
-            int xtab_size = computeResizeAreaTab(ssize.width, dsize.width, cn, scale_x, xtab);
-            int ytab_size = computeResizeAreaTab(ssize.height, dsize.height, 1, scale_y, ytab);
-
-            AutoBuffer<int> _tabofs(dsize.height + 1);
-            int* tabofs = _tabofs;
-            for( k = 0, dy = 0; k < ytab_size; k++ )
-            {
-                if( k == 0 || ytab[k].di != ytab[k-1].di )
-                {
-                    assert( ytab[k].di == dy );
-                    tabofs[dy++] = k;
-                }
-            }
-            tabofs[dy] = ytab_size;
-
-            func( src, dst, xtab, xtab_size, ytab, ytab_size, tabofs );
-            return;
-        }
-    }
-
-    int xmin = 0, xmax = dsize.width, width = dsize.width*cn;
-    bool area_mode = interpolation == INTER_AREA;
-    bool fixpt = depth == CV_8U;
-    float fx, fy;
-    ResizeFunc func=0;
-    int ksize=0, ksize2;
-    if( interpolation == INTER_CUBIC )
-        ksize = 4, func = cubic_tab[depth];
-    else if( interpolation == INTER_LANCZOS4 )
-        ksize = 8, func = lanczos4_tab[depth];
-    else if( interpolation == INTER_LINEAR || interpolation == INTER_AREA )
-        ksize = 2, func = linear_tab[depth];
-    else
-        CV_Error( CV_StsBadArg, "Unknown interpolation method" );
-    ksize2 = ksize/2;
-
-    CV_Assert( func != 0 );
-
-    AutoBuffer<uchar> _buffer((width + dsize.height)*(sizeof(int) + sizeof(float)*ksize));
-    int* xofs = (int*)(uchar*)_buffer;
-    int* yofs = xofs + width;
-    float* alpha = (float*)(yofs + dsize.height);
-    short* ialpha = (short*)alpha;
-    float* beta = alpha + width*ksize;
-    short* ibeta = ialpha + width*ksize;
-    float cbuf[MAX_ESIZE];
-
-    for( dx = 0; dx < dsize.width; dx++ )
-    {
-        if( !area_mode )
-        {
-            fx = (float)((dx+0.5)*scale_x - 0.5);
-            sx = cvFloor(fx);
-            fx -= sx;
-        }
-        else
-        {
-            sx = cvFloor(dx*scale_x);
-            fx = (float)((dx+1) - (sx+1)*inv_scale_x);
-            fx = fx <= 0 ? 0.f : fx - cvFloor(fx);
-        }
-
-        if( sx < ksize2-1 )
-        {
-            xmin = dx+1;
-            if( sx < 0 )
-                fx = 0, sx = 0;
-        }
-
-        if( sx + ksize2 >= ssize.width )
-        {
-            xmax = std::min( xmax, dx );
-            if( sx >= ssize.width-1 )
-                fx = 0, sx = ssize.width-1;
-        }
-
-        for( k = 0, sx *= cn; k < cn; k++ )
-            xofs[dx*cn + k] = sx + k;
-
-        if( interpolation == INTER_CUBIC )
-            interpolateCubic( fx, cbuf );
-        else if( interpolation == INTER_LANCZOS4 )
-            interpolateLanczos4( fx, cbuf );
-        else
-        {
-            cbuf[0] = 1.f - fx;
-            cbuf[1] = fx;
-        }
-        if( fixpt )
-        {
-            for( k = 0; k < ksize; k++ )
-                ialpha[dx*cn*ksize + k] = saturate_cast<short>(cbuf[k]*INTER_RESIZE_COEF_SCALE);
-            for( ; k < cn*ksize; k++ )
-                ialpha[dx*cn*ksize + k] = ialpha[dx*cn*ksize + k - ksize];
-        }
-        else
-        {
-            for( k = 0; k < ksize; k++ )
-                alpha[dx*cn*ksize + k] = cbuf[k];
-            for( ; k < cn*ksize; k++ )
-                alpha[dx*cn*ksize + k] = alpha[dx*cn*ksize + k - ksize];
-        }
-    }
-
-    for( dy = 0; dy < dsize.height; dy++ )
-    {
-        if( !area_mode )
-        {
-            fy = (float)((dy+0.5)*scale_y - 0.5);
-            sy = cvFloor(fy);
-            fy -= sy;
-        }
-        else
-        {
-            sy = cvFloor(dy*scale_y);
-            fy = (float)((dy+1) - (sy+1)*inv_scale_y);
-            fy = fy <= 0 ? 0.f : fy - cvFloor(fy);
-        }
-
-        yofs[dy] = sy;
-        if( interpolation == INTER_CUBIC )
-            interpolateCubic( fy, cbuf );
-        else if( interpolation == INTER_LANCZOS4 )
-            interpolateLanczos4( fy, cbuf );
-        else
-        {
-            cbuf[0] = 1.f - fy;
-            cbuf[1] = fy;
-        }
-
-        if( fixpt )
-        {
-            for( k = 0; k < ksize; k++ )
-                ibeta[dy*ksize + k] = saturate_cast<short>(cbuf[k]*INTER_RESIZE_COEF_SCALE);
-        }
-        else
-        {
-            for( k = 0; k < ksize; k++ )
-                beta[dy*ksize + k] = cbuf[k];
-        }
-    }
-
-    func( src, dst, xofs, fixpt ? (void*)ialpha : (void*)alpha, yofs,
-          fixpt ? (void*)ibeta : (void*)beta, xmin, xmax, ksize );
-}
-
-
 /****************************************************************************************\
 *                       General warping (affine, perspective, remap)                     *
 \****************************************************************************************/
-
-namespace cv
-{
 
 template<typename T>
 static void remapNearest( const Mat& _src, Mat& _dst, const Mat& _xy,
                           int borderType, const Scalar& _borderValue )
 {
     Size ssize = _src.size(), dsize = _dst.size();
-    int cn = _src.channels();
-    const T* S0 = (const T*)_src.data;
+    const int cn = _src.channels();
+    const T* S0 = _src.ptr<T>();
+    T cval[CV_CN_MAX];
     size_t sstep = _src.step/sizeof(S0[0]);
-    Scalar_<T> cval(saturate_cast<T>(_borderValue[0]),
-        saturate_cast<T>(_borderValue[1]),
-        saturate_cast<T>(_borderValue[2]),
-        saturate_cast<T>(_borderValue[3]));
-    int dx, dy;
+
+    for(int k = 0; k < cn; k++ )
+        cval[k] = saturate_cast<T>(_borderValue[k & 3]);
 
     unsigned width1 = ssize.width, height1 = ssize.height;
 
@@ -1980,14 +347,14 @@ static void remapNearest( const Mat& _src, Mat& _dst, const Mat& _xy,
         dsize.height = 1;
     }
 
-    for( dy = 0; dy < dsize.height; dy++ )
+    for(int dy = 0; dy < dsize.height; dy++ )
     {
-        T* D = (T*)(_dst.data + _dst.step*dy);
-        const short* XY = (const short*)(_xy.data + _xy.step*dy);
+        T* D = _dst.ptr<T>(dy);
+        const short* XY = _xy.ptr<short>(dy);
 
         if( cn == 1 )
         {
-            for( dx = 0; dx < dsize.width; dx++ )
+            for(int dx = 0; dx < dsize.width; dx++ )
             {
                 int sx = XY[dx*2], sy = XY[dx*2+1];
                 if( (unsigned)sx < width1 && (unsigned)sy < height1 )
@@ -2013,9 +380,9 @@ static void remapNearest( const Mat& _src, Mat& _dst, const Mat& _xy,
         }
         else
         {
-            for( dx = 0; dx < dsize.width; dx++, D += cn )
+            for(int dx = 0; dx < dsize.width; dx++, D += cn )
             {
-                int sx = XY[dx*2], sy = XY[dx*2+1], k;
+                int sx = XY[dx*2], sy = XY[dx*2+1];
                 const T *S;
                 if( (unsigned)sx < width1 && (unsigned)sy < height1 )
                 {
@@ -2032,7 +399,7 @@ static void remapNearest( const Mat& _src, Mat& _dst, const Mat& _xy,
                     else
                     {
                         S = S0 + sy*sstep + sx*cn;
-                        for( k = 0; k < cn; k++ )
+                        for(int k = 0; k < cn; k++ )
                             D[k] = S[k];
                     }
                 }
@@ -2052,7 +419,7 @@ static void remapNearest( const Mat& _src, Mat& _dst, const Mat& _xy,
                         sy = borderInterpolate(sy, ssize.height, borderType);
                         S = S0 + sy*sstep + sx*cn;
                     }
-                    for( k = 0; k < cn; k++ )
+                    for(int k = 0; k < cn; k++ )
                         D[k] = S[k];
                 }
             }
@@ -2067,199 +434,203 @@ struct RemapNoVec
                     const void*, int ) const { return 0; }
 };
 
-#if CV_SSE2
+#if CV_SIMD128
+
+typedef unsigned short CV_DECL_ALIGNED(1) unaligned_ushort;
+typedef int CV_DECL_ALIGNED(1) unaligned_int;
 
 struct RemapVec_8u
 {
     int operator()( const Mat& _src, void* _dst, const short* XY,
                     const ushort* FXY, const void* _wtab, int width ) const
     {
-        int cn = _src.channels();
+        int cn = _src.channels(), x = 0, sstep = (int)_src.step;
 
-        if( (cn != 1 && cn != 3 && cn != 4) || !checkHardwareSupport(CV_CPU_SSE2) )
+        if( (cn != 1 && cn != 3 && cn != 4) || sstep > 0x8000 )
             return 0;
 
-        const uchar *S0 = _src.data, *S1 = _src.data + _src.step;
+        const uchar *S0 = _src.ptr(), *S1 = _src.ptr(1);
         const short* wtab = cn == 1 ? (const short*)_wtab : &BilinearTab_iC4[0][0][0];
         uchar* D = (uchar*)_dst;
-        int x = 0, sstep = (int)_src.step;
-        __m128i delta = _mm_set1_epi32(INTER_REMAP_COEF_SCALE/2);
-        __m128i xy2ofs = _mm_set1_epi32(cn + (sstep << 16));
-        __m128i z = _mm_setzero_si128();
+        v_int32x4 delta = v_setall_s32(INTER_REMAP_COEF_SCALE / 2);
+        v_int16x8 xy2ofs = v_reinterpret_as_s16(v_setall_s32(cn + (sstep << 16)));
         int CV_DECL_ALIGNED(16) iofs0[4], iofs1[4];
+        const uchar* src_limit_8bytes = _src.datalimit - v_int16x8::nlanes;
+#define CV_PICK_AND_PACK_RGB(ptr, offset, result)  \
+        {                                          \
+            const uchar* const p = ((const uchar*)ptr) + (offset); \
+            if (p <= src_limit_8bytes)             \
+            {                                      \
+                v_uint8x16 rrggbb, dummy;          \
+                v_uint16x8 rrggbb8, dummy8;        \
+                v_uint8x16 rgb0 = v_reinterpret_as_u8(v_int32x4(*(unaligned_int*)(p), 0, 0, 0)); \
+                v_uint8x16 rgb1 = v_reinterpret_as_u8(v_int32x4(*(unaligned_int*)(p + 3), 0, 0, 0)); \
+                v_zip(rgb0, rgb1, rrggbb, dummy);  \
+                v_expand(rrggbb, rrggbb8, dummy8); \
+                result = v_reinterpret_as_s16(rrggbb8); \
+            }                                      \
+            else                                   \
+            {                                      \
+                result = v_int16x8((short)p[0], (short)p[3], /* r0r1 */ \
+                                   (short)p[1], (short)p[4], /* g0g1 */ \
+                                   (short)p[2], (short)p[5], /* b0b1 */ 0, 0); \
+            }                                      \
+        }
+#define CV_PICK_AND_PACK_RGBA(ptr, offset, result) \
+        {                                          \
+            const uchar* const p = ((const uchar*)ptr) + (offset); \
+            CV_DbgAssert(p <= src_limit_8bytes);   \
+            v_uint8x16 rrggbbaa, dummy;            \
+            v_uint16x8 rrggbbaa8, dummy8;          \
+            v_uint8x16 rgba0 = v_reinterpret_as_u8(v_int32x4(*(unaligned_int*)(p), 0, 0, 0)); \
+            v_uint8x16 rgba1 = v_reinterpret_as_u8(v_int32x4(*(unaligned_int*)(p + v_int32x4::nlanes), 0, 0, 0)); \
+            v_zip(rgba0, rgba1, rrggbbaa, dummy);  \
+            v_expand(rrggbbaa, rrggbbaa8, dummy8); \
+            result = v_reinterpret_as_s16(rrggbbaa8); \
+        }
+#define CV_PICK_AND_PACK4(base,offset)             \
+            v_uint16x8(*(unaligned_ushort*)(base + offset[0]), *(unaligned_ushort*)(base + offset[1]), \
+                       *(unaligned_ushort*)(base + offset[2]), *(unaligned_ushort*)(base + offset[3]), \
+                       0, 0, 0, 0)
 
         if( cn == 1 )
         {
             for( ; x <= width - 8; x += 8 )
             {
-                __m128i xy0 = _mm_loadu_si128( (const __m128i*)(XY + x*2));
-                __m128i xy1 = _mm_loadu_si128( (const __m128i*)(XY + x*2 + 8));
-                __m128i v0, v1, v2, v3, a0, a1, b0, b1;
-                unsigned i0, i1;
+                v_int16x8 _xy0 = v_load(XY + x*2);
+                v_int16x8 _xy1 = v_load(XY + x*2 + 8);
+                v_int32x4 v0, v1, v2, v3, a0, b0, c0, d0, a1, b1, c1, d1, a2, b2, c2, d2;
 
-                xy0 = _mm_madd_epi16( xy0, xy2ofs );
-                xy1 = _mm_madd_epi16( xy1, xy2ofs );
-                _mm_store_si128( (__m128i*)iofs0, xy0 );
-                _mm_store_si128( (__m128i*)iofs1, xy1 );
+                v_int32x4 xy0 = v_dotprod( _xy0, xy2ofs );
+                v_int32x4 xy1 = v_dotprod( _xy1, xy2ofs );
+                v_store( iofs0, xy0 );
+                v_store( iofs1, xy1 );
 
-                i0 = *(ushort*)(S0 + iofs0[0]) + (*(ushort*)(S0 + iofs0[1]) << 16);
-                i1 = *(ushort*)(S0 + iofs0[2]) + (*(ushort*)(S0 + iofs0[3]) << 16);
-                v0 = _mm_unpacklo_epi32(_mm_cvtsi32_si128(i0), _mm_cvtsi32_si128(i1));
-                i0 = *(ushort*)(S1 + iofs0[0]) + (*(ushort*)(S1 + iofs0[1]) << 16);
-                i1 = *(ushort*)(S1 + iofs0[2]) + (*(ushort*)(S1 + iofs0[3]) << 16);
-                v1 = _mm_unpacklo_epi32(_mm_cvtsi32_si128(i0), _mm_cvtsi32_si128(i1));
-                v0 = _mm_unpacklo_epi8(v0, z);
-                v1 = _mm_unpacklo_epi8(v1, z);
+                v_uint16x8 stub, dummy;
+                v_uint16x8 vec16;
+                vec16 = CV_PICK_AND_PACK4(S0, iofs0);
+                v_expand(v_reinterpret_as_u8(vec16), stub, dummy);
+                v0 = v_reinterpret_as_s32(stub);
+                vec16 = CV_PICK_AND_PACK4(S1, iofs0);
+                v_expand(v_reinterpret_as_u8(vec16), stub, dummy);
+                v1 = v_reinterpret_as_s32(stub);
 
-                a0 = _mm_unpacklo_epi32(_mm_loadl_epi64((__m128i*)(wtab+FXY[x]*4)),
-                                        _mm_loadl_epi64((__m128i*)(wtab+FXY[x+1]*4)));
-                a1 = _mm_unpacklo_epi32(_mm_loadl_epi64((__m128i*)(wtab+FXY[x+2]*4)),
-                                        _mm_loadl_epi64((__m128i*)(wtab+FXY[x+3]*4)));
-                b0 = _mm_unpacklo_epi64(a0, a1);
-                b1 = _mm_unpackhi_epi64(a0, a1);
-                v0 = _mm_madd_epi16(v0, b0);
-                v1 = _mm_madd_epi16(v1, b1);
-                v0 = _mm_add_epi32(_mm_add_epi32(v0, v1), delta);
+                v_zip(v_load_low((int*)(wtab + FXY[x]     * 4)), v_load_low((int*)(wtab + FXY[x + 1] * 4)), a0, a1);
+                v_zip(v_load_low((int*)(wtab + FXY[x + 2] * 4)), v_load_low((int*)(wtab + FXY[x + 3] * 4)), b0, b1);
+                v_recombine(a0, b0, a2, b2);
+                v1 = v_dotprod(v_reinterpret_as_s16(v1), v_reinterpret_as_s16(b2), delta);
+                v0 = v_dotprod(v_reinterpret_as_s16(v0), v_reinterpret_as_s16(a2), v1);
 
-                i0 = *(ushort*)(S0 + iofs1[0]) + (*(ushort*)(S0 + iofs1[1]) << 16);
-                i1 = *(ushort*)(S0 + iofs1[2]) + (*(ushort*)(S0 + iofs1[3]) << 16);
-                v2 = _mm_unpacklo_epi32(_mm_cvtsi32_si128(i0), _mm_cvtsi32_si128(i1));
-                i0 = *(ushort*)(S1 + iofs1[0]) + (*(ushort*)(S1 + iofs1[1]) << 16);
-                i1 = *(ushort*)(S1 + iofs1[2]) + (*(ushort*)(S1 + iofs1[3]) << 16);
-                v3 = _mm_unpacklo_epi32(_mm_cvtsi32_si128(i0), _mm_cvtsi32_si128(i1));
-                v2 = _mm_unpacklo_epi8(v2, z);
-                v3 = _mm_unpacklo_epi8(v3, z);
+                vec16 = CV_PICK_AND_PACK4(S0, iofs1);
+                v_expand(v_reinterpret_as_u8(vec16), stub, dummy);
+                v2 = v_reinterpret_as_s32(stub);
+                vec16 = CV_PICK_AND_PACK4(S1, iofs1);
+                v_expand(v_reinterpret_as_u8(vec16), stub, dummy);
+                v3 = v_reinterpret_as_s32(stub);
 
-                a0 = _mm_unpacklo_epi32(_mm_loadl_epi64((__m128i*)(wtab+FXY[x+4]*4)),
-                                        _mm_loadl_epi64((__m128i*)(wtab+FXY[x+5]*4)));
-                a1 = _mm_unpacklo_epi32(_mm_loadl_epi64((__m128i*)(wtab+FXY[x+6]*4)),
-                                        _mm_loadl_epi64((__m128i*)(wtab+FXY[x+7]*4)));
-                b0 = _mm_unpacklo_epi64(a0, a1);
-                b1 = _mm_unpackhi_epi64(a0, a1);
-                v2 = _mm_madd_epi16(v2, b0);
-                v3 = _mm_madd_epi16(v3, b1);
-                v2 = _mm_add_epi32(_mm_add_epi32(v2, v3), delta);
+                v_zip(v_load_low((int*)(wtab + FXY[x + 4] * 4)), v_load_low((int*)(wtab + FXY[x + 5] * 4)), c0, c1);
+                v_zip(v_load_low((int*)(wtab + FXY[x + 6] * 4)), v_load_low((int*)(wtab + FXY[x + 7] * 4)), d0, d1);
+                v_recombine(c0, d0, c2, d2);
+                v3 = v_dotprod(v_reinterpret_as_s16(v3), v_reinterpret_as_s16(d2), delta);
+                v2 = v_dotprod(v_reinterpret_as_s16(v2), v_reinterpret_as_s16(c2), v3);
 
-                v0 = _mm_srai_epi32(v0, INTER_REMAP_COEF_BITS);
-                v2 = _mm_srai_epi32(v2, INTER_REMAP_COEF_BITS);
-                v0 = _mm_packus_epi16(_mm_packs_epi32(v0, v2), z);
-                _mm_storel_epi64( (__m128i*)(D + x), v0 );
+                v0 = v0 >> INTER_REMAP_COEF_BITS;
+                v2 = v2 >> INTER_REMAP_COEF_BITS;
+                v_pack_u_store(D + x, v_pack(v0, v2));
             }
         }
         else if( cn == 3 )
         {
             for( ; x <= width - 5; x += 4, D += 12 )
             {
-                __m128i xy0 = _mm_loadu_si128( (const __m128i*)(XY + x*2));
-                __m128i u0, v0, u1, v1;
+                v_int16x8 u0, v0, u1, v1;
+                v_int16x8 _xy0 = v_load(XY + x * 2);
 
-                xy0 = _mm_madd_epi16( xy0, xy2ofs );
-                _mm_store_si128( (__m128i*)iofs0, xy0 );
-                const __m128i *w0, *w1;
-                w0 = (const __m128i*)(wtab + FXY[x]*16);
-                w1 = (const __m128i*)(wtab + FXY[x+1]*16);
+                v_int32x4 xy0 = v_dotprod(_xy0, xy2ofs);
+                v_store(iofs0, xy0);
 
-                u0 = _mm_unpacklo_epi8(_mm_cvtsi32_si128(*(int*)(S0 + iofs0[0])),
-                                       _mm_cvtsi32_si128(*(int*)(S0 + iofs0[0] + 3)));
-                v0 = _mm_unpacklo_epi8(_mm_cvtsi32_si128(*(int*)(S1 + iofs0[0])),
-                                       _mm_cvtsi32_si128(*(int*)(S1 + iofs0[0] + 3)));
-                u1 = _mm_unpacklo_epi8(_mm_cvtsi32_si128(*(int*)(S0 + iofs0[1])),
-                                       _mm_cvtsi32_si128(*(int*)(S0 + iofs0[1] + 3)));
-                v1 = _mm_unpacklo_epi8(_mm_cvtsi32_si128(*(int*)(S1 + iofs0[1])),
-                                       _mm_cvtsi32_si128(*(int*)(S1 + iofs0[1] + 3)));
-                u0 = _mm_unpacklo_epi8(u0, z);
-                v0 = _mm_unpacklo_epi8(v0, z);
-                u1 = _mm_unpacklo_epi8(u1, z);
-                v1 = _mm_unpacklo_epi8(v1, z);
-                u0 = _mm_add_epi32(_mm_madd_epi16(u0, w0[0]), _mm_madd_epi16(v0, w0[1]));
-                u1 = _mm_add_epi32(_mm_madd_epi16(u1, w1[0]), _mm_madd_epi16(v1, w1[1]));
-                u0 = _mm_srai_epi32(_mm_add_epi32(u0, delta), INTER_REMAP_COEF_BITS);
-                u1 = _mm_srai_epi32(_mm_add_epi32(u1, delta), INTER_REMAP_COEF_BITS);
-                u0 = _mm_slli_si128(u0, 4);
-                u0 = _mm_packs_epi32(u0, u1);
-                u0 = _mm_packus_epi16(u0, u0);
-                _mm_storel_epi64((__m128i*)D, _mm_srli_si128(u0,1));
+                int offset0 = FXY[x] * 16;
+                int offset1 = FXY[x + 1] * 16;
+                int offset2 = FXY[x + 2] * 16;
+                int offset3 = FXY[x + 3] * 16;
+                v_int16x8 w00 = v_load(wtab + offset0);
+                v_int16x8 w01 = v_load(wtab + offset0 + 8);
+                v_int16x8 w10 = v_load(wtab + offset1);
+                v_int16x8 w11 = v_load(wtab + offset1 + 8);
 
-                w0 = (const __m128i*)(wtab + FXY[x+2]*16);
-                w1 = (const __m128i*)(wtab + FXY[x+3]*16);
+                CV_PICK_AND_PACK_RGB(S0, iofs0[0], u0);
+                CV_PICK_AND_PACK_RGB(S1, iofs0[0], v0);
+                CV_PICK_AND_PACK_RGB(S0, iofs0[1], u1);
+                CV_PICK_AND_PACK_RGB(S1, iofs0[1], v1);
 
-                u0 = _mm_unpacklo_epi8(_mm_cvtsi32_si128(*(int*)(S0 + iofs0[2])),
-                                       _mm_cvtsi32_si128(*(int*)(S0 + iofs0[2] + 3)));
-                v0 = _mm_unpacklo_epi8(_mm_cvtsi32_si128(*(int*)(S1 + iofs0[2])),
-                                       _mm_cvtsi32_si128(*(int*)(S1 + iofs0[2] + 3)));
-                u1 = _mm_unpacklo_epi8(_mm_cvtsi32_si128(*(int*)(S0 + iofs0[3])),
-                                       _mm_cvtsi32_si128(*(int*)(S0 + iofs0[3] + 3)));
-                v1 = _mm_unpacklo_epi8(_mm_cvtsi32_si128(*(int*)(S1 + iofs0[3])),
-                                       _mm_cvtsi32_si128(*(int*)(S1 + iofs0[3] + 3)));
-                u0 = _mm_unpacklo_epi8(u0, z);
-                v0 = _mm_unpacklo_epi8(v0, z);
-                u1 = _mm_unpacklo_epi8(u1, z);
-                v1 = _mm_unpacklo_epi8(v1, z);
-                u0 = _mm_add_epi32(_mm_madd_epi16(u0, w0[0]), _mm_madd_epi16(v0, w0[1]));
-                u1 = _mm_add_epi32(_mm_madd_epi16(u1, w1[0]), _mm_madd_epi16(v1, w1[1]));
-                u0 = _mm_srai_epi32(_mm_add_epi32(u0, delta), INTER_REMAP_COEF_BITS);
-                u1 = _mm_srai_epi32(_mm_add_epi32(u1, delta), INTER_REMAP_COEF_BITS);
-                u0 = _mm_slli_si128(u0, 4);
-                u0 = _mm_packs_epi32(u0, u1);
-                u0 = _mm_packus_epi16(u0, u0);
-                _mm_storel_epi64((__m128i*)(D + 6), _mm_srli_si128(u0,1));
+                v_int32x4 result0 = v_dotprod(u0, w00, v_dotprod(v0, w01, delta)) >> INTER_REMAP_COEF_BITS;
+                v_int32x4 result1 = v_dotprod(u1, w10, v_dotprod(v1, w11, delta)) >> INTER_REMAP_COEF_BITS;
+
+                result0 = v_rotate_left<1>(result0);
+                v_int16x8 result8 = v_pack(result0, result1);
+                v_uint8x16 result16 = v_pack_u(result8, result8);
+                v_store_low(D, v_rotate_right<1>(result16));
+
+
+                w00 = v_load(wtab + offset2);
+                w01 = v_load(wtab + offset2 + 8);
+                w10 = v_load(wtab + offset3);
+                w11 = v_load(wtab + offset3 + 8);
+                CV_PICK_AND_PACK_RGB(S0, iofs0[2], u0);
+                CV_PICK_AND_PACK_RGB(S1, iofs0[2], v0);
+                CV_PICK_AND_PACK_RGB(S0, iofs0[3], u1);
+                CV_PICK_AND_PACK_RGB(S1, iofs0[3], v1);
+
+                result0 = v_dotprod(u0, w00, v_dotprod(v0, w01, delta)) >> INTER_REMAP_COEF_BITS;
+                result1 = v_dotprod(u1, w10, v_dotprod(v1, w11, delta)) >> INTER_REMAP_COEF_BITS;
+
+                result0 = v_rotate_left<1>(result0);
+                result8 = v_pack(result0, result1);
+                result16 = v_pack_u(result8, result8);
+                v_store_low(D + 6, v_rotate_right<1>(result16));
             }
         }
         else if( cn == 4 )
         {
             for( ; x <= width - 4; x += 4, D += 16 )
             {
-                __m128i xy0 = _mm_loadu_si128( (const __m128i*)(XY + x*2));
-                __m128i u0, v0, u1, v1;
+                v_int16x8 _xy0 = v_load(XY + x * 2);
+                v_int16x8 u0, v0, u1, v1;
 
-                xy0 = _mm_madd_epi16( xy0, xy2ofs );
-                _mm_store_si128( (__m128i*)iofs0, xy0 );
-                const __m128i *w0, *w1;
-                w0 = (const __m128i*)(wtab + FXY[x]*16);
-                w1 = (const __m128i*)(wtab + FXY[x+1]*16);
+                v_int32x4 xy0 = v_dotprod( _xy0, xy2ofs );
+                v_store(iofs0, xy0);
+                int offset0 = FXY[x] * 16;
+                int offset1 = FXY[x + 1] * 16;
+                int offset2 = FXY[x + 2] * 16;
+                int offset3 = FXY[x + 3] * 16;
 
-                u0 = _mm_unpacklo_epi8(_mm_cvtsi32_si128(*(int*)(S0 + iofs0[0])),
-                                       _mm_cvtsi32_si128(*(int*)(S0 + iofs0[0] + 4)));
-                v0 = _mm_unpacklo_epi8(_mm_cvtsi32_si128(*(int*)(S1 + iofs0[0])),
-                                       _mm_cvtsi32_si128(*(int*)(S1 + iofs0[0] + 4)));
-                u1 = _mm_unpacklo_epi8(_mm_cvtsi32_si128(*(int*)(S0 + iofs0[1])),
-                                       _mm_cvtsi32_si128(*(int*)(S0 + iofs0[1] + 4)));
-                v1 = _mm_unpacklo_epi8(_mm_cvtsi32_si128(*(int*)(S1 + iofs0[1])),
-                                       _mm_cvtsi32_si128(*(int*)(S1 + iofs0[1] + 4)));
-                u0 = _mm_unpacklo_epi8(u0, z);
-                v0 = _mm_unpacklo_epi8(v0, z);
-                u1 = _mm_unpacklo_epi8(u1, z);
-                v1 = _mm_unpacklo_epi8(v1, z);
-                u0 = _mm_add_epi32(_mm_madd_epi16(u0, w0[0]), _mm_madd_epi16(v0, w0[1]));
-                u1 = _mm_add_epi32(_mm_madd_epi16(u1, w1[0]), _mm_madd_epi16(v1, w1[1]));
-                u0 = _mm_srai_epi32(_mm_add_epi32(u0, delta), INTER_REMAP_COEF_BITS);
-                u1 = _mm_srai_epi32(_mm_add_epi32(u1, delta), INTER_REMAP_COEF_BITS);
-                u0 = _mm_packs_epi32(u0, u1);
-                u0 = _mm_packus_epi16(u0, u0);
-                _mm_storel_epi64((__m128i*)D, u0);
+                v_int16x8 w00 = v_load(wtab + offset0);
+                v_int16x8 w01 = v_load(wtab + offset0 + 8);
+                v_int16x8 w10 = v_load(wtab + offset1);
+                v_int16x8 w11 = v_load(wtab + offset1 + 8);
+                CV_PICK_AND_PACK_RGBA(S0, iofs0[0], u0);
+                CV_PICK_AND_PACK_RGBA(S1, iofs0[0], v0);
+                CV_PICK_AND_PACK_RGBA(S0, iofs0[1], u1);
+                CV_PICK_AND_PACK_RGBA(S1, iofs0[1], v1);
 
-                w0 = (const __m128i*)(wtab + FXY[x+2]*16);
-                w1 = (const __m128i*)(wtab + FXY[x+3]*16);
+                v_int32x4 result0 = v_dotprod(u0, w00, v_dotprod(v0, w01, delta)) >> INTER_REMAP_COEF_BITS;
+                v_int32x4 result1 = v_dotprod(u1, w10, v_dotprod(v1, w11, delta)) >> INTER_REMAP_COEF_BITS;
+                v_int16x8 result8 = v_pack(result0, result1);
+                v_pack_u_store(D, result8);
 
-                u0 = _mm_unpacklo_epi8(_mm_cvtsi32_si128(*(int*)(S0 + iofs0[2])),
-                                       _mm_cvtsi32_si128(*(int*)(S0 + iofs0[2] + 4)));
-                v0 = _mm_unpacklo_epi8(_mm_cvtsi32_si128(*(int*)(S1 + iofs0[2])),
-                                       _mm_cvtsi32_si128(*(int*)(S1 + iofs0[2] + 4)));
-                u1 = _mm_unpacklo_epi8(_mm_cvtsi32_si128(*(int*)(S0 + iofs0[3])),
-                                       _mm_cvtsi32_si128(*(int*)(S0 + iofs0[3] + 4)));
-                v1 = _mm_unpacklo_epi8(_mm_cvtsi32_si128(*(int*)(S1 + iofs0[3])),
-                                       _mm_cvtsi32_si128(*(int*)(S1 + iofs0[3] + 4)));
-                u0 = _mm_unpacklo_epi8(u0, z);
-                v0 = _mm_unpacklo_epi8(v0, z);
-                u1 = _mm_unpacklo_epi8(u1, z);
-                v1 = _mm_unpacklo_epi8(v1, z);
-                u0 = _mm_add_epi32(_mm_madd_epi16(u0, w0[0]), _mm_madd_epi16(v0, w0[1]));
-                u1 = _mm_add_epi32(_mm_madd_epi16(u1, w1[0]), _mm_madd_epi16(v1, w1[1]));
-                u0 = _mm_srai_epi32(_mm_add_epi32(u0, delta), INTER_REMAP_COEF_BITS);
-                u1 = _mm_srai_epi32(_mm_add_epi32(u1, delta), INTER_REMAP_COEF_BITS);
-                u0 = _mm_packs_epi32(u0, u1);
-                u0 = _mm_packus_epi16(u0, u0);
-                _mm_storel_epi64((__m128i*)(D + 8), u0);
+                w00 = v_load(wtab + offset2);
+                w01 = v_load(wtab + offset2 + 8);
+                w10 = v_load(wtab + offset3);
+                w11 = v_load(wtab + offset3 + 8);
+                CV_PICK_AND_PACK_RGBA(S0, iofs0[2], u0);
+                CV_PICK_AND_PACK_RGBA(S1, iofs0[2], v0);
+                CV_PICK_AND_PACK_RGBA(S0, iofs0[3], u1);
+                CV_PICK_AND_PACK_RGBA(S1, iofs0[3], v1);
+
+                result0 = v_dotprod(u0, w00, v_dotprod(v0, w01, delta)) >> INTER_REMAP_COEF_BITS;
+                result1 = v_dotprod(u1, w10, v_dotprod(v1, w11, delta)) >> INTER_REMAP_COEF_BITS;
+                result8 = v_pack(result0, result1);
+                v_pack_u_store(D + 8, result8);
             }
         }
 
@@ -2282,34 +653,33 @@ static void remapBilinear( const Mat& _src, Mat& _dst, const Mat& _xy,
     typedef typename CastOp::rtype T;
     typedef typename CastOp::type1 WT;
     Size ssize = _src.size(), dsize = _dst.size();
-    int cn = _src.channels();
+    const int cn = _src.channels();
     const AT* wtab = (const AT*)_wtab;
-    const T* S0 = (const T*)_src.data;
+    const T* S0 = _src.ptr<T>();
     size_t sstep = _src.step/sizeof(S0[0]);
-    Scalar_<T> cval(saturate_cast<T>(_borderValue[0]),
-        saturate_cast<T>(_borderValue[1]),
-        saturate_cast<T>(_borderValue[2]),
-        saturate_cast<T>(_borderValue[3]));
-    int dx, dy;
+    T cval[CV_CN_MAX];
     CastOp castOp;
     VecOp vecOp;
 
+    for(int k = 0; k < cn; k++ )
+        cval[k] = saturate_cast<T>(_borderValue[k & 3]);
+
     unsigned width1 = std::max(ssize.width-1, 0), height1 = std::max(ssize.height-1, 0);
-    CV_Assert( cn <= 4 && ssize.area() > 0 );
-#if CV_SSE2
+    CV_Assert( !ssize.empty() );
+#if CV_SIMD128
     if( _src.type() == CV_8UC3 )
         width1 = std::max(ssize.width-2, 0);
 #endif
 
-    for( dy = 0; dy < dsize.height; dy++ )
+    for(int dy = 0; dy < dsize.height; dy++ )
     {
-        T* D = (T*)(_dst.data + _dst.step*dy);
-        const short* XY = (const short*)(_xy.data + _xy.step*dy);
-        const ushort* FXY = (const ushort*)(_fxy.data + _fxy.step*dy);
+        T* D = _dst.ptr<T>(dy);
+        const short* XY = _xy.ptr<short>(dy);
+        const ushort* FXY = _fxy.ptr<ushort>(dy);
         int X0 = 0;
         bool prevInlier = false;
 
-        for( dx = 0; dx <= dsize.width; dx++ )
+        for(int dx = 0; dx <= dsize.width; dx++ )
         {
             bool curInlier = dx < dsize.width ?
                 (unsigned)XY[dx*2] < width1 &&
@@ -2359,7 +729,7 @@ static void remapBilinear( const Mat& _src, Mat& _dst, const Mat& _xy,
                         WT t2 = S[2]*w[0] + S[5]*w[1] + S[sstep+2]*w[2] + S[sstep+5]*w[3];
                         D[0] = castOp(t0); D[1] = castOp(t1); D[2] = castOp(t2);
                     }
-                else
+                else if( cn == 4 )
                     for( ; dx < X1; dx++, D += 4 )
                     {
                         int sx = XY[dx*2], sy = XY[dx*2+1];
@@ -2371,6 +741,18 @@ static void remapBilinear( const Mat& _src, Mat& _dst, const Mat& _xy,
                         t0 = S[2]*w[0] + S[6]*w[1] + S[sstep+2]*w[2] + S[sstep+6]*w[3];
                         t1 = S[3]*w[0] + S[7]*w[1] + S[sstep+3]*w[2] + S[sstep+7]*w[3];
                         D[2] = castOp(t0); D[3] = castOp(t1);
+                    }
+                else
+                    for( ; dx < X1; dx++, D += cn )
+                    {
+                        int sx = XY[dx*2], sy = XY[dx*2+1];
+                        const AT* w = wtab + FXY[dx]*4;
+                        const T* S = S0 + sy*sstep + sx*cn;
+                        for(int k = 0; k < cn; k++ )
+                        {
+                            WT t0 = S[k]*w[0] + S[k+cn]*w[1] + S[sstep+k]*w[2] + S[sstep+k+cn]*w[3];
+                            D[k] = castOp(t0);
+                        }
                     }
             }
             else
@@ -2425,12 +807,12 @@ static void remapBilinear( const Mat& _src, Mat& _dst, const Mat& _xy,
                 else
                     for( ; dx < X1; dx++, D += cn )
                     {
-                        int sx = XY[dx*2], sy = XY[dx*2+1], k;
+                        int sx = XY[dx*2], sy = XY[dx*2+1];
                         if( borderType == BORDER_CONSTANT &&
                             (sx >= ssize.width || sx+1 < 0 ||
                              sy >= ssize.height || sy+1 < 0) )
                         {
-                            for( k = 0; k < cn; k++ )
+                            for(int k = 0; k < cn; k++ )
                                 D[k] = cval[k];
                         }
                         else
@@ -2464,7 +846,7 @@ static void remapBilinear( const Mat& _src, Mat& _dst, const Mat& _xy,
                                 v2 = sx0 >= 0 && sy1 >= 0 ? S0 + sy1*sstep + sx0*cn : &cval[0];
                                 v3 = sx1 >= 0 && sy1 >= 0 ? S0 + sy1*sstep + sx1*cn : &cval[0];
                             }
-                            for( k = 0; k < cn; k++ )
+                            for(int k = 0; k < cn; k++ )
                                 D[k] = castOp(WT(v0[k]*w[0] + v1[k]*w[1] + v2[k]*w[2] + v3[k]*w[3]));
                         }
                     }
@@ -2482,16 +864,16 @@ static void remapBicubic( const Mat& _src, Mat& _dst, const Mat& _xy,
     typedef typename CastOp::rtype T;
     typedef typename CastOp::type1 WT;
     Size ssize = _src.size(), dsize = _dst.size();
-    int cn = _src.channels();
+    const int cn = _src.channels();
     const AT* wtab = (const AT*)_wtab;
-    const T* S0 = (const T*)_src.data;
+    const T* S0 = _src.ptr<T>();
     size_t sstep = _src.step/sizeof(S0[0]);
-    Scalar_<T> cval(saturate_cast<T>(_borderValue[0]),
-        saturate_cast<T>(_borderValue[1]),
-        saturate_cast<T>(_borderValue[2]),
-        saturate_cast<T>(_borderValue[3]));
-    int dx, dy;
+    T cval[CV_CN_MAX];
     CastOp castOp;
+
+    for(int k = 0; k < cn; k++ )
+        cval[k] = saturate_cast<T>(_borderValue[k & 3]);
+
     int borderType1 = borderType != BORDER_TRANSPARENT ? borderType : BORDER_REFLECT_101;
 
     unsigned width1 = std::max(ssize.width-3, 0), height1 = std::max(ssize.height-3, 0);
@@ -2502,21 +884,20 @@ static void remapBicubic( const Mat& _src, Mat& _dst, const Mat& _xy,
         dsize.height = 1;
     }
 
-    for( dy = 0; dy < dsize.height; dy++ )
+    for(int dy = 0; dy < dsize.height; dy++ )
     {
-        T* D = (T*)(_dst.data + _dst.step*dy);
-        const short* XY = (const short*)(_xy.data + _xy.step*dy);
-        const ushort* FXY = (const ushort*)(_fxy.data + _fxy.step*dy);
+        T* D = _dst.ptr<T>(dy);
+        const short* XY = _xy.ptr<short>(dy);
+        const ushort* FXY = _fxy.ptr<ushort>(dy);
 
-        for( dx = 0; dx < dsize.width; dx++, D += cn )
+        for(int dx = 0; dx < dsize.width; dx++, D += cn )
         {
             int sx = XY[dx*2]-1, sy = XY[dx*2+1]-1;
             const AT* w = wtab + FXY[dx]*16;
-            int i, k;
             if( (unsigned)sx < width1 && (unsigned)sy < height1 )
             {
                 const T* S = S0 + sy*sstep + sx*cn;
-                for( k = 0; k < cn; k++ )
+                for(int k = 0; k < cn; k++ )
                 {
                     WT sum = S[0]*w[0] + S[cn]*w[1] + S[cn*2]*w[2] + S[cn*3]*w[3];
                     S += sstep;
@@ -2541,21 +922,21 @@ static void remapBicubic( const Mat& _src, Mat& _dst, const Mat& _xy,
                     (sx >= ssize.width || sx+4 <= 0 ||
                     sy >= ssize.height || sy+4 <= 0))
                 {
-                    for( k = 0; k < cn; k++ )
+                    for(int k = 0; k < cn; k++ )
                         D[k] = cval[k];
                     continue;
                 }
 
-                for( i = 0; i < 4; i++ )
+                for(int i = 0; i < 4; i++ )
                 {
                     x[i] = borderInterpolate(sx + i, ssize.width, borderType1)*cn;
                     y[i] = borderInterpolate(sy + i, ssize.height, borderType1);
                 }
 
-                for( k = 0; k < cn; k++, S0++, w -= 16 )
+                for(int k = 0; k < cn; k++, S0++, w -= 16 )
                 {
                     WT cv = cval[k], sum = cv*ONE;
-                    for( i = 0; i < 4; i++, w += 4 )
+                    for(int i = 0; i < 4; i++, w += 4 )
                     {
                         int yi = y[i];
                         const T* S = S0 + yi*sstep;
@@ -2587,16 +968,16 @@ static void remapLanczos4( const Mat& _src, Mat& _dst, const Mat& _xy,
     typedef typename CastOp::rtype T;
     typedef typename CastOp::type1 WT;
     Size ssize = _src.size(), dsize = _dst.size();
-    int cn = _src.channels();
+    const int cn = _src.channels();
     const AT* wtab = (const AT*)_wtab;
-    const T* S0 = (const T*)_src.data;
+    const T* S0 = _src.ptr<T>();
     size_t sstep = _src.step/sizeof(S0[0]);
-    Scalar_<T> cval(saturate_cast<T>(_borderValue[0]),
-        saturate_cast<T>(_borderValue[1]),
-        saturate_cast<T>(_borderValue[2]),
-        saturate_cast<T>(_borderValue[3]));
-    int dx, dy;
+    T cval[CV_CN_MAX];
     CastOp castOp;
+
+    for(int k = 0; k < cn; k++ )
+        cval[k] = saturate_cast<T>(_borderValue[k & 3]);
+
     int borderType1 = borderType != BORDER_TRANSPARENT ? borderType : BORDER_REFLECT_101;
 
     unsigned width1 = std::max(ssize.width-7, 0), height1 = std::max(ssize.height-7, 0);
@@ -2607,21 +988,20 @@ static void remapLanczos4( const Mat& _src, Mat& _dst, const Mat& _xy,
         dsize.height = 1;
     }
 
-    for( dy = 0; dy < dsize.height; dy++ )
+    for(int dy = 0; dy < dsize.height; dy++ )
     {
-        T* D = (T*)(_dst.data + _dst.step*dy);
-        const short* XY = (const short*)(_xy.data + _xy.step*dy);
-        const ushort* FXY = (const ushort*)(_fxy.data + _fxy.step*dy);
+        T* D = _dst.ptr<T>(dy);
+        const short* XY = _xy.ptr<short>(dy);
+        const ushort* FXY = _fxy.ptr<ushort>(dy);
 
-        for( dx = 0; dx < dsize.width; dx++, D += cn )
+        for(int dx = 0; dx < dsize.width; dx++, D += cn )
         {
             int sx = XY[dx*2]-3, sy = XY[dx*2+1]-3;
             const AT* w = wtab + FXY[dx]*64;
             const T* S = S0 + sy*sstep + sx*cn;
-            int i, k;
             if( (unsigned)sx < width1 && (unsigned)sy < height1 )
             {
-                for( k = 0; k < cn; k++ )
+                for(int k = 0; k < cn; k++ )
                 {
                     WT sum = 0;
                     for( int r = 0; r < 8; r++, S += sstep, w += 8 )
@@ -2644,21 +1024,21 @@ static void remapLanczos4( const Mat& _src, Mat& _dst, const Mat& _xy,
                     (sx >= ssize.width || sx+8 <= 0 ||
                     sy >= ssize.height || sy+8 <= 0))
                 {
-                    for( k = 0; k < cn; k++ )
+                    for(int k = 0; k < cn; k++ )
                         D[k] = cval[k];
                     continue;
                 }
 
-                for( i = 0; i < 8; i++ )
+                for(int i = 0; i < 8; i++ )
                 {
                     x[i] = borderInterpolate(sx + i, ssize.width, borderType1)*cn;
                     y[i] = borderInterpolate(sy + i, ssize.height, borderType1);
                 }
 
-                for( k = 0; k < cn; k++, S0++, w -= 64 )
+                for(int k = 0; k < cn; k++, S0++, w -= 64 )
                 {
                     WT cv = cval[k], sum = cv*ONE;
-                    for( i = 0; i < 8; i++, w += 8 )
+                    for(int i = 0; i < 8; i++, w += 8 )
                     {
                         int yi = y[i];
                         const T* S1 = S0 + yi*sstep;
@@ -2702,24 +1082,21 @@ class RemapInvoker :
 {
 public:
     RemapInvoker(const Mat& _src, Mat& _dst, const Mat *_m1,
-                 const Mat *_m2, int _interpolation, int _borderType, const Scalar &_borderValue,
+                 const Mat *_m2, int _borderType, const Scalar &_borderValue,
                  int _planar_input, RemapNNFunc _nnfunc, RemapFunc _ifunc, const void *_ctab) :
         ParallelLoopBody(), src(&_src), dst(&_dst), m1(_m1), m2(_m2),
-        interpolation(_interpolation), borderType(_borderType), borderValue(_borderValue),
+        borderType(_borderType), borderValue(_borderValue),
         planar_input(_planar_input), nnfunc(_nnfunc), ifunc(_ifunc), ctab(_ctab)
     {
     }
 
-    virtual void operator() (const Range& range) const
+    virtual void operator() (const Range& range) const CV_OVERRIDE
     {
         int x, y, x1, y1;
         const int buf_size = 1 << 14;
         int brows0 = std::min(128, dst->rows), map_depth = m1->depth();
         int bcols0 = std::min(buf_size/brows0, dst->cols);
         brows0 = std::min(buf_size/bcols0, dst->rows);
-    #if CV_SSE2
-        bool useSIMD = checkHardwareSupport(CV_CPU_SSE2);
-    #endif
 
         Mat _bufxy(brows0, bcols0, CV_16SC2), _bufa;
         if( !nnfunc )
@@ -2736,15 +1113,15 @@ public:
 
                 if( nnfunc )
                 {
-                    if( m1->type() == CV_16SC2 && !m2->data ) // the data is already in the right format
+                    if( m1->type() == CV_16SC2 && m2->empty() ) // the data is already in the right format
                         bufxy = (*m1)(Rect(x, y, bcols, brows));
                     else if( map_depth != CV_32F )
                     {
                         for( y1 = 0; y1 < brows; y1++ )
                         {
-                            short* XY = (short*)(bufxy.data + bufxy.step*y1);
-                            const short* sXY = (const short*)(m1->data + m1->step*(y+y1)) + x*2;
-                            const ushort* sA = (const ushort*)(m2->data + m2->step*(y+y1)) + x;
+                            short* XY = bufxy.ptr<short>(y1);
+                            const short* sXY = m1->ptr<short>(y+y1) + x*2;
+                            const ushort* sA = m2->ptr<ushort>(y+y1) + x;
 
                             for( x1 = 0; x1 < bcols; x1++ )
                             {
@@ -2760,34 +1137,28 @@ public:
                     {
                         for( y1 = 0; y1 < brows; y1++ )
                         {
-                            short* XY = (short*)(bufxy.data + bufxy.step*y1);
-                            const float* sX = (const float*)(m1->data + m1->step*(y+y1)) + x;
-                            const float* sY = (const float*)(m2->data + m2->step*(y+y1)) + x;
+                            short* XY = bufxy.ptr<short>(y1);
+                            const float* sX = m1->ptr<float>(y+y1) + x;
+                            const float* sY = m2->ptr<float>(y+y1) + x;
                             x1 = 0;
 
-                        #if CV_SSE2
-                            if( useSIMD )
+                            #if CV_SIMD128
                             {
-                                for( ; x1 <= bcols - 8; x1 += 8 )
+                                int span = v_float32x4::nlanes;
+                                for( ; x1 <= bcols - span * 2; x1 += span * 2 )
                                 {
-                                    __m128 fx0 = _mm_loadu_ps(sX + x1);
-                                    __m128 fx1 = _mm_loadu_ps(sX + x1 + 4);
-                                    __m128 fy0 = _mm_loadu_ps(sY + x1);
-                                    __m128 fy1 = _mm_loadu_ps(sY + x1 + 4);
-                                    __m128i ix0 = _mm_cvtps_epi32(fx0);
-                                    __m128i ix1 = _mm_cvtps_epi32(fx1);
-                                    __m128i iy0 = _mm_cvtps_epi32(fy0);
-                                    __m128i iy1 = _mm_cvtps_epi32(fy1);
-                                    ix0 = _mm_packs_epi32(ix0, ix1);
-                                    iy0 = _mm_packs_epi32(iy0, iy1);
-                                    ix1 = _mm_unpacklo_epi16(ix0, iy0);
-                                    iy1 = _mm_unpackhi_epi16(ix0, iy0);
-                                    _mm_storeu_si128((__m128i*)(XY + x1*2), ix1);
-                                    _mm_storeu_si128((__m128i*)(XY + x1*2 + 8), iy1);
+                                    v_int32x4 ix0 = v_round(v_load(sX + x1));
+                                    v_int32x4 iy0 = v_round(v_load(sY + x1));
+                                    v_int32x4 ix1 = v_round(v_load(sX + x1 + span));
+                                    v_int32x4 iy1 = v_round(v_load(sY + x1 + span));
+
+                                    v_int16x8 dx, dy;
+                                    dx = v_pack(ix0, ix1);
+                                    dy = v_pack(iy0, iy1);
+                                    v_store_interleave(XY + x1 * 2, dx, dy);
                                 }
                             }
-                        #endif
-
+                            #endif
                             for( ; x1 < bcols; x1++ )
                             {
                                 XY[x1*2] = saturate_cast<short>(sX[x1]);
@@ -2802,79 +1173,102 @@ public:
                 Mat bufa(_bufa, Rect(0, 0, bcols, brows));
                 for( y1 = 0; y1 < brows; y1++ )
                 {
-                    short* XY = (short*)(bufxy.data + bufxy.step*y1);
-                    ushort* A = (ushort*)(bufa.data + bufa.step*y1);
+                    short* XY = bufxy.ptr<short>(y1);
+                    ushort* A = bufa.ptr<ushort>(y1);
 
                     if( m1->type() == CV_16SC2 && (m2->type() == CV_16UC1 || m2->type() == CV_16SC1) )
                     {
                         bufxy = (*m1)(Rect(x, y, bcols, brows));
-                        bufa = (*m2)(Rect(x, y, bcols, brows));
+
+                        const ushort* sA = m2->ptr<ushort>(y+y1) + x;
+                        x1 = 0;
+
+                        #if CV_SIMD128
+                        {
+                            v_uint16x8 v_scale = v_setall_u16(INTER_TAB_SIZE2 - 1);
+                            int span = v_uint16x8::nlanes;
+                            for( ; x1 <= bcols - span; x1 += span )
+                                v_store((unsigned short*)(A + x1), v_load(sA + x1) & v_scale);
+                        }
+                        #endif
+                        for( ; x1 < bcols; x1++ )
+                            A[x1] = (ushort)(sA[x1] & (INTER_TAB_SIZE2-1));
                     }
                     else if( planar_input )
                     {
-                        const float* sX = (const float*)(m1->data + m1->step*(y+y1)) + x;
-                        const float* sY = (const float*)(m2->data + m2->step*(y+y1)) + x;
+                        const float* sX = m1->ptr<float>(y+y1) + x;
+                        const float* sY = m2->ptr<float>(y+y1) + x;
 
                         x1 = 0;
-                    #if CV_SSE2
-                        if( useSIMD )
+                        #if CV_SIMD128
                         {
-                            __m128 scale = _mm_set1_ps((float)INTER_TAB_SIZE);
-                            __m128i mask = _mm_set1_epi32(INTER_TAB_SIZE-1);
-                            for( ; x1 <= bcols - 8; x1 += 8 )
+                            v_float32x4 v_scale = v_setall_f32((float)INTER_TAB_SIZE);
+                            v_int32x4 v_scale2 = v_setall_s32(INTER_TAB_SIZE - 1);
+                            int span = v_float32x4::nlanes;
+                            for( ; x1 <= bcols - span * 2; x1 += span * 2 )
                             {
-                                __m128 fx0 = _mm_loadu_ps(sX + x1);
-                                __m128 fx1 = _mm_loadu_ps(sX + x1 + 4);
-                                __m128 fy0 = _mm_loadu_ps(sY + x1);
-                                __m128 fy1 = _mm_loadu_ps(sY + x1 + 4);
-                                __m128i ix0 = _mm_cvtps_epi32(_mm_mul_ps(fx0, scale));
-                                __m128i ix1 = _mm_cvtps_epi32(_mm_mul_ps(fx1, scale));
-                                __m128i iy0 = _mm_cvtps_epi32(_mm_mul_ps(fy0, scale));
-                                __m128i iy1 = _mm_cvtps_epi32(_mm_mul_ps(fy1, scale));
-                                __m128i mx0 = _mm_and_si128(ix0, mask);
-                                __m128i mx1 = _mm_and_si128(ix1, mask);
-                                __m128i my0 = _mm_and_si128(iy0, mask);
-                                __m128i my1 = _mm_and_si128(iy1, mask);
-                                mx0 = _mm_packs_epi32(mx0, mx1);
-                                my0 = _mm_packs_epi32(my0, my1);
-                                my0 = _mm_slli_epi16(my0, INTER_BITS);
-                                mx0 = _mm_or_si128(mx0, my0);
-                                _mm_storeu_si128((__m128i*)(A + x1), mx0);
-                                ix0 = _mm_srai_epi32(ix0, INTER_BITS);
-                                ix1 = _mm_srai_epi32(ix1, INTER_BITS);
-                                iy0 = _mm_srai_epi32(iy0, INTER_BITS);
-                                iy1 = _mm_srai_epi32(iy1, INTER_BITS);
-                                ix0 = _mm_packs_epi32(ix0, ix1);
-                                iy0 = _mm_packs_epi32(iy0, iy1);
-                                ix1 = _mm_unpacklo_epi16(ix0, iy0);
-                                iy1 = _mm_unpackhi_epi16(ix0, iy0);
-                                _mm_storeu_si128((__m128i*)(XY + x1*2), ix1);
-                                _mm_storeu_si128((__m128i*)(XY + x1*2 + 8), iy1);
+                                v_int32x4 v_sx0 = v_round(v_scale * v_load(sX + x1));
+                                v_int32x4 v_sy0 = v_round(v_scale * v_load(sY + x1));
+                                v_int32x4 v_sx1 = v_round(v_scale * v_load(sX + x1 + span));
+                                v_int32x4 v_sy1 = v_round(v_scale * v_load(sY + x1 + span));
+                                v_uint16x8 v_sx8 = v_reinterpret_as_u16(v_pack(v_sx0 & v_scale2, v_sx1 & v_scale2));
+                                v_uint16x8 v_sy8 = v_reinterpret_as_u16(v_pack(v_sy0 & v_scale2, v_sy1 & v_scale2));
+                                v_uint16x8 v_v = v_shl<INTER_BITS>(v_sy8) | (v_sx8);
+                                v_store(A + x1, v_v);
+
+                                v_int16x8 v_d0 = v_pack(v_shr<INTER_BITS>(v_sx0), v_shr<INTER_BITS>(v_sx1));
+                                v_int16x8 v_d1 = v_pack(v_shr<INTER_BITS>(v_sy0), v_shr<INTER_BITS>(v_sy1));
+                                v_store_interleave(XY + (x1 << 1), v_d0, v_d1);
                             }
                         }
-                    #endif
-
+                        #endif
                         for( ; x1 < bcols; x1++ )
                         {
                             int sx = cvRound(sX[x1]*INTER_TAB_SIZE);
                             int sy = cvRound(sY[x1]*INTER_TAB_SIZE);
                             int v = (sy & (INTER_TAB_SIZE-1))*INTER_TAB_SIZE + (sx & (INTER_TAB_SIZE-1));
-                            XY[x1*2] = (short)(sx >> INTER_BITS);
-                            XY[x1*2+1] = (short)(sy >> INTER_BITS);
+                            XY[x1*2] = saturate_cast<short>(sx >> INTER_BITS);
+                            XY[x1*2+1] = saturate_cast<short>(sy >> INTER_BITS);
                             A[x1] = (ushort)v;
                         }
                     }
                     else
                     {
-                        const float* sXY = (const float*)(m1->data + m1->step*(y+y1)) + x*2;
+                        const float* sXY = m1->ptr<float>(y+y1) + x*2;
+                        x1 = 0;
 
-                        for( x1 = 0; x1 < bcols; x1++ )
+                        #if CV_SIMD128
+                        {
+                            v_float32x4 v_scale = v_setall_f32((float)INTER_TAB_SIZE);
+                            v_int32x4 v_scale2 = v_setall_s32(INTER_TAB_SIZE - 1), v_scale3 = v_setall_s32(INTER_TAB_SIZE);
+                            int span = v_float32x4::nlanes;
+                            for( ; x1 <= bcols - span * 2; x1 += span * 2 )
+                            {
+                                v_float32x4 v_fx, v_fy;
+                                v_load_deinterleave(sXY + (x1 << 1), v_fx, v_fy);
+                                v_int32x4 v_sx0 = v_round(v_fx * v_scale);
+                                v_int32x4 v_sy0 = v_round(v_fy * v_scale);
+                                v_load_deinterleave(sXY + ((x1 + span) << 1), v_fx, v_fy);
+                                v_int32x4 v_sx1 = v_round(v_fx * v_scale);
+                                v_int32x4 v_sy1 = v_round(v_fy * v_scale);
+                                v_int32x4 v_v0 = v_muladd(v_scale3, (v_sy0 & v_scale2), (v_sx0 & v_scale2));
+                                v_int32x4 v_v1 = v_muladd(v_scale3, (v_sy1 & v_scale2), (v_sx1 & v_scale2));
+                                v_uint16x8 v_v8 = v_reinterpret_as_u16(v_pack(v_v0, v_v1));
+                                v_store(A + x1, v_v8);
+                                v_int16x8 v_dx = v_pack(v_shr<INTER_BITS>(v_sx0), v_shr<INTER_BITS>(v_sx1));
+                                v_int16x8 v_dy = v_pack(v_shr<INTER_BITS>(v_sy0), v_shr<INTER_BITS>(v_sy1));
+                                v_store_interleave(XY + (x1 << 1), v_dx, v_dy);
+                            }
+                        }
+                        #endif
+
+                        for( ; x1 < bcols; x1++ )
                         {
                             int sx = cvRound(sXY[x1*2]*INTER_TAB_SIZE);
                             int sy = cvRound(sXY[x1*2+1]*INTER_TAB_SIZE);
                             int v = (sy & (INTER_TAB_SIZE-1))*INTER_TAB_SIZE + (sx & (INTER_TAB_SIZE-1));
-                            XY[x1*2] = (short)(sx >> INTER_BITS);
-                            XY[x1*2+1] = (short)(sy >> INTER_BITS);
+                            XY[x1*2] = saturate_cast<short>(sx >> INTER_BITS);
+                            XY[x1*2+1] = saturate_cast<short>(sy >> INTER_BITS);
                             A[x1] = (ushort)v;
                         }
                     }
@@ -2888,7 +1282,7 @@ private:
     const Mat* src;
     Mat* dst;
     const Mat *m1, *m2;
-    int interpolation, borderType;
+    int borderType;
     Scalar borderValue;
     int planar_input;
     RemapNNFunc nnfunc;
@@ -2896,12 +1290,383 @@ private:
     const void *ctab;
 };
 
+#ifdef HAVE_OPENCL
+
+static bool ocl_remap(InputArray _src, OutputArray _dst, InputArray _map1, InputArray _map2,
+                      int interpolation, int borderType, const Scalar& borderValue)
+{
+    const ocl::Device & dev = ocl::Device::getDefault();
+    int cn = _src.channels(), type = _src.type(), depth = _src.depth(),
+            rowsPerWI = dev.isIntel() ? 4 : 1;
+
+    if (borderType == BORDER_TRANSPARENT || !(interpolation == INTER_LINEAR || interpolation == INTER_NEAREST)
+            || _map1.type() == CV_16SC1 || _map2.type() == CV_16SC1)
+        return false;
+
+    UMat src = _src.getUMat(), map1 = _map1.getUMat(), map2 = _map2.getUMat();
+
+    if( (map1.type() == CV_16SC2 && (map2.type() == CV_16UC1 || map2.empty())) ||
+        (map2.type() == CV_16SC2 && (map1.type() == CV_16UC1 || map1.empty())) )
+    {
+        if (map1.type() != CV_16SC2)
+            std::swap(map1, map2);
+    }
+    else
+        CV_Assert( map1.type() == CV_32FC2 || (map1.type() == CV_32FC1 && map2.type() == CV_32FC1) );
+
+    _dst.create(map1.size(), type);
+    UMat dst = _dst.getUMat();
+
+    String kernelName = "remap";
+    if (map1.type() == CV_32FC2 && map2.empty())
+        kernelName += "_32FC2";
+    else if (map1.type() == CV_16SC2)
+    {
+        kernelName += "_16SC2";
+        if (!map2.empty())
+            kernelName += "_16UC1";
+    }
+    else if (map1.type() == CV_32FC1 && map2.type() == CV_32FC1)
+        kernelName += "_2_32FC1";
+    else
+        CV_Error(Error::StsBadArg, "Unsupported map types");
+
+    static const char * const interMap[] = { "INTER_NEAREST", "INTER_LINEAR", "INTER_CUBIC", "INTER_LINEAR", "INTER_LANCZOS" };
+    static const char * const borderMap[] = { "BORDER_CONSTANT", "BORDER_REPLICATE", "BORDER_REFLECT", "BORDER_WRAP",
+                           "BORDER_REFLECT_101", "BORDER_TRANSPARENT" };
+    String buildOptions = format("-D %s -D %s -D T=%s -D rowsPerWI=%d",
+                                 interMap[interpolation], borderMap[borderType],
+                                 ocl::typeToStr(type), rowsPerWI);
+
+    if (interpolation != INTER_NEAREST)
+    {
+        char cvt[3][40];
+        int wdepth = std::max(CV_32F, depth);
+        buildOptions = buildOptions
+                      + format(" -D WT=%s -D convertToT=%s -D convertToWT=%s"
+                               " -D convertToWT2=%s -D WT2=%s",
+                               ocl::typeToStr(CV_MAKE_TYPE(wdepth, cn)),
+                               ocl::convertTypeStr(wdepth, depth, cn, cvt[0]),
+                               ocl::convertTypeStr(depth, wdepth, cn, cvt[1]),
+                               ocl::convertTypeStr(CV_32S, wdepth, 2, cvt[2]),
+                               ocl::typeToStr(CV_MAKE_TYPE(wdepth, 2)));
+    }
+    int scalarcn = cn == 3 ? 4 : cn;
+    int sctype = CV_MAKETYPE(depth, scalarcn);
+    buildOptions += format(" -D T=%s -D T1=%s -D cn=%d -D ST=%s -D depth=%d",
+                           ocl::typeToStr(type), ocl::typeToStr(depth),
+                           cn, ocl::typeToStr(sctype), depth);
+
+    ocl::Kernel k(kernelName.c_str(), ocl::imgproc::remap_oclsrc, buildOptions);
+
+    Mat scalar(1, 1, sctype, borderValue);
+    ocl::KernelArg srcarg = ocl::KernelArg::ReadOnly(src), dstarg = ocl::KernelArg::WriteOnly(dst),
+            map1arg = ocl::KernelArg::ReadOnlyNoSize(map1),
+            scalararg = ocl::KernelArg::Constant((void*)scalar.ptr(), scalar.elemSize());
+
+    if (map2.empty())
+        k.args(srcarg, dstarg, map1arg, scalararg);
+    else
+        k.args(srcarg, dstarg, map1arg, ocl::KernelArg::ReadOnlyNoSize(map2), scalararg);
+
+    size_t globalThreads[2] = { (size_t)dst.cols, ((size_t)dst.rows + rowsPerWI - 1) / rowsPerWI };
+    return k.run(2, globalThreads, NULL, false);
+}
+
+#if 0
+/**
+@deprecated with old version of cv::linearPolar
+*/
+static bool ocl_linearPolar(InputArray _src, OutputArray _dst,
+    Point2f center, double maxRadius, int flags)
+{
+    UMat src_with_border; // don't scope this variable (it holds image data)
+
+    UMat mapx, mapy, r, cp_sp;
+    UMat src = _src.getUMat();
+    _dst.create(src.size(), src.type());
+    Size dsize = src.size();
+    r.create(Size(1, dsize.width), CV_32F);
+    cp_sp.create(Size(1, dsize.height), CV_32FC2);
+
+    mapx.create(dsize, CV_32F);
+    mapy.create(dsize, CV_32F);
+    size_t w = dsize.width;
+    size_t h = dsize.height;
+    String buildOptions;
+    unsigned mem_size = 32;
+    if (flags & CV_WARP_INVERSE_MAP)
+    {
+        buildOptions = "-D InverseMap";
+    }
+    else
+    {
+        buildOptions = format("-D ForwardMap  -D MEM_SIZE=%d", mem_size);
+    }
+    String retval;
+    ocl::Program p(ocl::imgproc::linearPolar_oclsrc, buildOptions, retval);
+    ocl::Kernel k("linearPolar", p);
+    ocl::KernelArg ocl_mapx = ocl::KernelArg::PtrReadWrite(mapx), ocl_mapy = ocl::KernelArg::PtrReadWrite(mapy);
+    ocl::KernelArg  ocl_cp_sp = ocl::KernelArg::PtrReadWrite(cp_sp);
+    ocl::KernelArg ocl_r = ocl::KernelArg::PtrReadWrite(r);
+
+    if (!(flags & CV_WARP_INVERSE_MAP))
+    {
+
+
+
+        ocl::Kernel computeAngleRadius_Kernel("computeAngleRadius", p);
+        float PI2_height = (float) CV_2PI / dsize.height;
+        float maxRadius_width = (float) maxRadius / dsize.width;
+        computeAngleRadius_Kernel.args(ocl_cp_sp, ocl_r, maxRadius_width, PI2_height, (unsigned)dsize.width, (unsigned)dsize.height);
+        size_t max_dim = max(h, w);
+        computeAngleRadius_Kernel.run(1, &max_dim, NULL, false);
+        k.args(ocl_mapx, ocl_mapy, ocl_cp_sp, ocl_r, center.x, center.y, (unsigned)dsize.width, (unsigned)dsize.height);
+    }
+    else
+    {
+        const int ANGLE_BORDER = 1;
+
+        cv::copyMakeBorder(src, src_with_border, ANGLE_BORDER, ANGLE_BORDER, 0, 0, BORDER_WRAP);
+        src = src_with_border;
+        Size ssize = src_with_border.size();
+        ssize.height -= 2 * ANGLE_BORDER;
+        float ascale =  ssize.height / ((float)CV_2PI);
+        float pscale =  ssize.width / ((float) maxRadius);
+
+        k.args(ocl_mapx, ocl_mapy, ascale, pscale, center.x, center.y, ANGLE_BORDER, (unsigned)dsize.width, (unsigned)dsize.height);
+
+
+    }
+    size_t globalThreads[2] = { (size_t)dsize.width , (size_t)dsize.height };
+    size_t localThreads[2] = { mem_size , mem_size };
+    k.run(2, globalThreads, localThreads, false);
+    remap(src, _dst, mapx, mapy, flags & cv::INTER_MAX, (flags & CV_WARP_FILL_OUTLIERS) ? cv::BORDER_CONSTANT : cv::BORDER_TRANSPARENT);
+    return true;
+}
+static bool ocl_logPolar(InputArray _src, OutputArray _dst,
+    Point2f center, double M, int flags)
+{
+    if (M <= 0)
+        CV_Error(CV_StsOutOfRange, "M should be >0");
+    UMat src_with_border; // don't scope this variable (it holds image data)
+
+    UMat mapx, mapy, r, cp_sp;
+    UMat src = _src.getUMat();
+    _dst.create(src.size(), src.type());
+    Size dsize = src.size();
+    r.create(Size(1, dsize.width), CV_32F);
+    cp_sp.create(Size(1, dsize.height), CV_32FC2);
+
+    mapx.create(dsize, CV_32F);
+    mapy.create(dsize, CV_32F);
+    size_t w = dsize.width;
+    size_t h = dsize.height;
+    String buildOptions;
+    unsigned mem_size = 32;
+    if (flags & CV_WARP_INVERSE_MAP)
+    {
+        buildOptions = "-D InverseMap";
+    }
+    else
+    {
+        buildOptions = format("-D ForwardMap  -D MEM_SIZE=%d", mem_size);
+    }
+    String retval;
+    ocl::Program p(ocl::imgproc::logPolar_oclsrc, buildOptions, retval);
+    //ocl::Program p(ocl::imgproc::my_linearPolar_oclsrc, buildOptions, retval);
+    //printf("%s\n", retval);
+    ocl::Kernel k("logPolar", p);
+    ocl::KernelArg ocl_mapx = ocl::KernelArg::PtrReadWrite(mapx), ocl_mapy = ocl::KernelArg::PtrReadWrite(mapy);
+    ocl::KernelArg  ocl_cp_sp = ocl::KernelArg::PtrReadWrite(cp_sp);
+    ocl::KernelArg ocl_r = ocl::KernelArg::PtrReadWrite(r);
+
+    if (!(flags & CV_WARP_INVERSE_MAP))
+    {
+
+
+
+        ocl::Kernel computeAngleRadius_Kernel("computeAngleRadius", p);
+        float PI2_height = (float) CV_2PI / dsize.height;
+
+        computeAngleRadius_Kernel.args(ocl_cp_sp, ocl_r, (float)M, PI2_height, (unsigned)dsize.width, (unsigned)dsize.height);
+        size_t max_dim = max(h, w);
+        computeAngleRadius_Kernel.run(1, &max_dim, NULL, false);
+        k.args(ocl_mapx, ocl_mapy, ocl_cp_sp, ocl_r, center.x, center.y, (unsigned)dsize.width, (unsigned)dsize.height);
+    }
+    else
+    {
+        const int ANGLE_BORDER = 1;
+
+        cv::copyMakeBorder(src, src_with_border, ANGLE_BORDER, ANGLE_BORDER, 0, 0, BORDER_WRAP);
+        src = src_with_border;
+        Size ssize = src_with_border.size();
+        ssize.height -= 2 * ANGLE_BORDER;
+        float ascale =  ssize.height / ((float)CV_2PI);
+
+
+        k.args(ocl_mapx, ocl_mapy, ascale, (float)M, center.x, center.y, ANGLE_BORDER, (unsigned)dsize.width, (unsigned)dsize.height);
+
+
+    }
+    size_t globalThreads[2] = { (size_t)dsize.width , (size_t)dsize.height };
+    size_t localThreads[2] = { mem_size , mem_size };
+    k.run(2, globalThreads, localThreads, false);
+    remap(src, _dst, mapx, mapy, flags & cv::INTER_MAX, (flags & CV_WARP_FILL_OUTLIERS) ? cv::BORDER_CONSTANT : cv::BORDER_TRANSPARENT);
+    return true;
+}
+#endif
+
+#endif
+
+#ifdef HAVE_OPENVX
+static bool openvx_remap(Mat src, Mat dst, Mat map1, Mat map2, int interpolation, const Scalar& borderValue)
+{
+    vx_interpolation_type_e inter_type;
+    switch (interpolation)
+    {
+    case INTER_LINEAR:
+#if VX_VERSION > VX_VERSION_1_0
+        inter_type = VX_INTERPOLATION_BILINEAR;
+#else
+        inter_type = VX_INTERPOLATION_TYPE_BILINEAR;
+#endif
+        break;
+    case INTER_NEAREST:
+/* NEAREST_NEIGHBOR mode disabled since OpenCV round half to even while OpenVX sample implementation round half up
+#if VX_VERSION > VX_VERSION_1_0
+        inter_type = VX_INTERPOLATION_NEAREST_NEIGHBOR;
+#else
+        inter_type = VX_INTERPOLATION_TYPE_NEAREST_NEIGHBOR;
+#endif
+        if (!map1.empty())
+            for (int y = 0; y < map1.rows; ++y)
+            {
+                float* line = map1.ptr<float>(y);
+                for (int x = 0; x < map1.cols; ++x)
+                    line[x] = cvRound(line[x]);
+            }
+        if (!map2.empty())
+            for (int y = 0; y < map2.rows; ++y)
+            {
+                float* line = map2.ptr<float>(y);
+                for (int x = 0; x < map2.cols; ++x)
+                    line[x] = cvRound(line[x]);
+            }
+        break;
+*/
+    case INTER_AREA://AREA interpolation mode is unsupported
+    default:
+        return false;
+    }
+
+    try
+    {
+        ivx::Context ctx = ovx::getOpenVXContext();
+
+        Mat a;
+        if (dst.data != src.data)
+            a = src;
+        else
+            src.copyTo(a);
+
+        ivx::Image
+            ia = ivx::Image::createFromHandle(ctx, VX_DF_IMAGE_U8,
+                ivx::Image::createAddressing(a.cols, a.rows, 1, (vx_int32)(a.step)), a.data),
+            ib = ivx::Image::createFromHandle(ctx, VX_DF_IMAGE_U8,
+                ivx::Image::createAddressing(dst.cols, dst.rows, 1, (vx_int32)(dst.step)), dst.data);
+
+        //ATTENTION: VX_CONTEXT_IMMEDIATE_BORDER attribute change could lead to strange issues in multi-threaded environments
+        //since OpenVX standard says nothing about thread-safety for now
+        ivx::border_t prevBorder = ctx.immediateBorder();
+        ctx.setImmediateBorder(VX_BORDER_CONSTANT, (vx_uint8)(borderValue[0]));
+
+        ivx::Remap map = ivx::Remap::create(ctx, src.cols, src.rows, dst.cols, dst.rows);
+        if (map1.empty()) map.setMappings(map2);
+        else if (map2.empty()) map.setMappings(map1);
+        else map.setMappings(map1, map2);
+        ivx::IVX_CHECK_STATUS(vxuRemap(ctx, ia, map, inter_type, ib));
+#ifdef VX_VERSION_1_1
+        ib.swapHandle();
+        ia.swapHandle();
+#endif
+
+        ctx.setImmediateBorder(prevBorder);
+    }
+    catch (const ivx::RuntimeError & e)
+    {
+        CV_Error(CV_StsInternal, e.what());
+        return false;
+    }
+    catch (const ivx::WrapperError & e)
+    {
+        CV_Error(CV_StsInternal, e.what());
+        return false;
+    }
+    return true;
+}
+#endif
+
+#if defined HAVE_IPP && !IPP_DISABLE_REMAP
+
+typedef IppStatus (CV_STDCALL * ippiRemap)(const void * pSrc, IppiSize srcSize, int srcStep, IppiRect srcRoi,
+                                           const Ipp32f* pxMap, int xMapStep, const Ipp32f* pyMap, int yMapStep,
+                                           void * pDst, int dstStep, IppiSize dstRoiSize, int interpolation);
+
+class IPPRemapInvoker :
+        public ParallelLoopBody
+{
+public:
+    IPPRemapInvoker(Mat & _src, Mat & _dst, Mat & _xmap, Mat & _ymap, ippiRemap _ippFunc,
+                    int _ippInterpolation, int _borderType, const Scalar & _borderValue, bool * _ok) :
+        ParallelLoopBody(), src(_src), dst(_dst), map1(_xmap), map2(_ymap), ippFunc(_ippFunc),
+        ippInterpolation(_ippInterpolation), borderType(_borderType), borderValue(_borderValue), ok(_ok)
+    {
+        *ok = true;
+    }
+
+    virtual void operator() (const Range & range) const
+    {
+        IppiRect srcRoiRect = { 0, 0, src.cols, src.rows };
+        Mat dstRoi = dst.rowRange(range);
+        IppiSize dstRoiSize = ippiSize(dstRoi.size());
+        int type = dst.type(), depth = CV_MAT_DEPTH(type), cn = CV_MAT_CN(type);
+
+        if (borderType == BORDER_CONSTANT &&
+                !IPPSet(borderValue, dstRoi.ptr(), (int)dstRoi.step, dstRoiSize, cn, depth))
+        {
+            *ok = false;
+            return;
+        }
+
+        if (CV_INSTRUMENT_FUN_IPP(ippFunc, src.ptr(), ippiSize(src.size()), (int)src.step, srcRoiRect,
+                    map1.ptr<Ipp32f>(), (int)map1.step, map2.ptr<Ipp32f>(), (int)map2.step,
+                    dstRoi.ptr(), (int)dstRoi.step, dstRoiSize, ippInterpolation) < 0)
+            *ok = false;
+        else
+        {
+            CV_IMPL_ADD(CV_IMPL_IPP|CV_IMPL_MT);
+        }
+    }
+
+private:
+    Mat & src, & dst, & map1, & map2;
+    ippiRemap ippFunc;
+    int ippInterpolation, borderType;
+    Scalar borderValue;
+    bool * ok;
+};
+
+#endif
+
 }
 
 void cv::remap( InputArray _src, OutputArray _dst,
                 InputArray _map1, InputArray _map2,
                 int interpolation, int borderType, const Scalar& borderValue )
 {
+    CV_INSTRUMENT_REGION();
+
     static RemapNNFunc nn_tab[] =
     {
         remapNearest<uchar>, remapNearest<schar>, remapNearest<ushort>, remapNearest<short>,
@@ -2935,17 +1700,78 @@ void cv::remap( InputArray _src, OutputArray _dst,
         remapLanczos4<Cast<double, double>, float, 1>, 0
     };
 
+    CV_Assert( !_map1.empty() );
+    CV_Assert( _map2.empty() || (_map2.size() == _map1.size()));
+
+    CV_OCL_RUN(_src.dims() <= 2 && _dst.isUMat(),
+               ocl_remap(_src, _dst, _map1, _map2, interpolation, borderType, borderValue))
+
     Mat src = _src.getMat(), map1 = _map1.getMat(), map2 = _map2.getMat();
-
-    CV_Assert( map1.size().area() > 0 );
-    CV_Assert( !map2.data || (map2.size() == map1.size()));
-
     _dst.create( map1.size(), src.type() );
     Mat dst = _dst.getMat();
+
+
+    CV_OVX_RUN(
+        src.type() == CV_8UC1 && dst.type() == CV_8UC1 &&
+        !ovx::skipSmallImages<VX_KERNEL_REMAP>(src.cols, src.rows) &&
+        (borderType& ~BORDER_ISOLATED) == BORDER_CONSTANT &&
+        ((map1.type() == CV_32FC2 && map2.empty() && map1.size == dst.size) ||
+         (map1.type() == CV_32FC1 && map2.type() == CV_32FC1 && map1.size == dst.size && map2.size == dst.size) ||
+         (map1.empty() && map2.type() == CV_32FC2 && map2.size == dst.size)) &&
+        ((borderType & BORDER_ISOLATED) != 0 || !src.isSubmatrix()),
+        openvx_remap(src, dst, map1, map2, interpolation, borderValue));
+
+    CV_Assert( dst.cols < SHRT_MAX && dst.rows < SHRT_MAX && src.cols < SHRT_MAX && src.rows < SHRT_MAX );
+
     if( dst.data == src.data )
         src = src.clone();
 
-    int depth = src.depth();
+    if( interpolation == INTER_AREA )
+        interpolation = INTER_LINEAR;
+
+    int type = src.type(), depth = CV_MAT_DEPTH(type);
+
+#if defined HAVE_IPP && !IPP_DISABLE_REMAP
+    CV_IPP_CHECK()
+    {
+        if ((interpolation == INTER_LINEAR || interpolation == INTER_CUBIC || interpolation == INTER_NEAREST) &&
+                map1.type() == CV_32FC1 && map2.type() == CV_32FC1 &&
+                (borderType == BORDER_CONSTANT || borderType == BORDER_TRANSPARENT))
+        {
+            int ippInterpolation =
+                interpolation == INTER_NEAREST ? IPPI_INTER_NN :
+                interpolation == INTER_LINEAR ? IPPI_INTER_LINEAR : IPPI_INTER_CUBIC;
+
+            ippiRemap ippFunc =
+                type == CV_8UC1 ? (ippiRemap)ippiRemap_8u_C1R :
+                type == CV_8UC3 ? (ippiRemap)ippiRemap_8u_C3R :
+                type == CV_8UC4 ? (ippiRemap)ippiRemap_8u_C4R :
+                type == CV_16UC1 ? (ippiRemap)ippiRemap_16u_C1R :
+                type == CV_16UC3 ? (ippiRemap)ippiRemap_16u_C3R :
+                type == CV_16UC4 ? (ippiRemap)ippiRemap_16u_C4R :
+                type == CV_32FC1 ? (ippiRemap)ippiRemap_32f_C1R :
+                type == CV_32FC3 ? (ippiRemap)ippiRemap_32f_C3R :
+                type == CV_32FC4 ? (ippiRemap)ippiRemap_32f_C4R : 0;
+
+            if (ippFunc)
+            {
+                bool ok;
+                IPPRemapInvoker invoker(src, dst, map1, map2, ippFunc, ippInterpolation,
+                                        borderType, borderValue, &ok);
+                Range range(0, dst.rows);
+                parallel_for_(range, invoker, dst.total() / (double)(1 << 16));
+
+                if (ok)
+                {
+                    CV_IMPL_ADD(CV_IMPL_IPP|CV_IMPL_MT);
+                    return;
+                }
+                setIppErrorStatus();
+            }
+        }
+    }
+#endif
+
     RemapNNFunc nnfunc = 0;
     RemapFunc ifunc = 0;
     const void* ctab = 0;
@@ -2959,15 +1785,16 @@ void cv::remap( InputArray _src, OutputArray _dst,
     }
     else
     {
-        if( interpolation == INTER_AREA )
-            interpolation = INTER_LINEAR;
-
         if( interpolation == INTER_LINEAR )
             ifunc = linear_tab[depth];
-        else if( interpolation == INTER_CUBIC )
+        else if( interpolation == INTER_CUBIC ){
             ifunc = cubic_tab[depth];
-        else if( interpolation == INTER_LANCZOS4 )
+            CV_Assert( _src.channels() <= 4 );
+        }
+        else if( interpolation == INTER_LANCZOS4 ){
             ifunc = lanczos4_tab[depth];
+            CV_Assert( _src.channels() <= 4 );
+        }
         else
             CV_Error( CV_StsBadArg, "Unknown interpolation method" );
         CV_Assert( ifunc != 0 );
@@ -2976,20 +1803,20 @@ void cv::remap( InputArray _src, OutputArray _dst,
 
     const Mat *m1 = &map1, *m2 = &map2;
 
-    if( (map1.type() == CV_16SC2 && (map2.type() == CV_16UC1 || map2.type() == CV_16SC1 || !map2.data)) ||
-        (map2.type() == CV_16SC2 && (map1.type() == CV_16UC1 || map1.type() == CV_16SC1 || !map1.data)) )
+    if( (map1.type() == CV_16SC2 && (map2.type() == CV_16UC1 || map2.type() == CV_16SC1 || map2.empty())) ||
+        (map2.type() == CV_16SC2 && (map1.type() == CV_16UC1 || map1.type() == CV_16SC1 || map1.empty())) )
     {
         if( map1.type() != CV_16SC2 )
             std::swap(m1, m2);
     }
     else
     {
-        CV_Assert( ((map1.type() == CV_32FC2 || map1.type() == CV_16SC2) && !map2.data) ||
+        CV_Assert( ((map1.type() == CV_32FC2 || map1.type() == CV_16SC2) && map2.empty()) ||
             (map1.type() == CV_32FC1 && map2.type() == CV_32FC1) );
         planar_input = map1.channels() == 1;
     }
 
-    RemapInvoker invoker(src, dst, m1, m2, interpolation,
+    RemapInvoker invoker(src, dst, m1, m2,
                          borderType, borderValue, planar_input, nnfunc, ifunc,
                          ctab);
     parallel_for_(Range(0, dst.rows), invoker, dst.total()/(double)(1<<16));
@@ -3000,6 +1827,8 @@ void cv::convertMaps( InputArray _map1, InputArray _map2,
                       OutputArray _dstmap1, OutputArray _dstmap2,
                       int dstm1type, bool nninterpolate )
 {
+    CV_INSTRUMENT_REGION();
+
     Mat map1 = _map1.getMat(), map2 = _map2.getMat(), dstmap1, dstmap2;
     Size size = map1.size();
     const Mat *m1 = &map1, *m2 = &map2;
@@ -3008,7 +1837,7 @@ void cv::convertMaps( InputArray _map1, InputArray _map2,
     CV_Assert( (m1type == CV_16SC2 && (nninterpolate || m2type == CV_16UC1 || m2type == CV_16SC1)) ||
                (m2type == CV_16SC2 && (nninterpolate || m1type == CV_16UC1 || m1type == CV_16SC1)) ||
                (m1type == CV_32FC1 && m2type == CV_32FC1) ||
-               (m1type == CV_32FC2 && !m2->data) );
+               (m1type == CV_32FC2 && m2->empty()) );
 
     if( m2type == CV_16SC2 )
     {
@@ -3035,7 +1864,7 @@ void cv::convertMaps( InputArray _map1, InputArray _map2,
         (m1type == CV_32FC2 && dstm1type == CV_16SC2))) )
     {
         m1->convertTo( dstmap1, dstmap1.type() );
-        if( dstmap2.data && dstmap2.type() == m2->type() )
+        if( !dstmap2.empty() && dstmap2.type() == m2->type() )
             m2->copyTo( dstmap2 );
         return;
     }
@@ -3054,77 +1883,262 @@ void cv::convertMaps( InputArray _map1, InputArray _map2,
         return;
     }
 
-    if( m1->isContinuous() && (!m2->data || m2->isContinuous()) &&
-        dstmap1.isContinuous() && (!dstmap2.data || dstmap2.isContinuous()) )
+    if( m1->isContinuous() && (m2->empty() || m2->isContinuous()) &&
+        dstmap1.isContinuous() && (dstmap2.empty() || dstmap2.isContinuous()) )
     {
         size.width *= size.height;
         size.height = 1;
     }
 
+#if CV_TRY_SSE4_1
+    bool useSSE4_1 = CV_CPU_HAS_SUPPORT_SSE4_1;
+#endif
+
     const float scale = 1.f/INTER_TAB_SIZE;
     int x, y;
     for( y = 0; y < size.height; y++ )
     {
-        const float* src1f = (const float*)(m1->data + m1->step*y);
-        const float* src2f = (const float*)(m2->data + m2->step*y);
+        const float* src1f = m1->ptr<float>(y);
+        const float* src2f = m2->ptr<float>(y);
         const short* src1 = (const short*)src1f;
         const ushort* src2 = (const ushort*)src2f;
 
-        float* dst1f = (float*)(dstmap1.data + dstmap1.step*y);
-        float* dst2f = (float*)(dstmap2.data + dstmap2.step*y);
+        float* dst1f = dstmap1.ptr<float>(y);
+        float* dst2f = dstmap2.ptr<float>(y);
         short* dst1 = (short*)dst1f;
         ushort* dst2 = (ushort*)dst2f;
+        x = 0;
 
         if( m1type == CV_32FC1 && dstm1type == CV_16SC2 )
         {
             if( nninterpolate )
-                for( x = 0; x < size.width; x++ )
+            {
+                #if CV_TRY_SSE4_1
+                if (useSSE4_1)
+                    opt_SSE4_1::convertMaps_nninterpolate32f1c16s_SSE41(src1f, src2f, dst1, size.width);
+                else
+                #endif
                 {
-                    dst1[x*2] = saturate_cast<short>(src1f[x]);
-                    dst1[x*2+1] = saturate_cast<short>(src2f[x]);
+                    #if CV_SIMD128
+                    {
+                        int span = v_int16x8::nlanes;
+                        for( ; x <= size.width - span; x += span )
+                        {
+                            v_int16x8 v_dst[2];
+                            #define CV_PACK_MAP(X) v_pack(v_round(v_load(X)), v_round(v_load((X)+4)))
+                            v_dst[0] = CV_PACK_MAP(src1f + x);
+                            v_dst[1] = CV_PACK_MAP(src2f + x);
+                            #undef CV_PACK_MAP
+                            v_store_interleave(dst1 + (x << 1), v_dst[0], v_dst[1]);
+                        }
+                    }
+                    #endif
+                    for( ; x < size.width; x++ )
+                    {
+                        dst1[x*2] = saturate_cast<short>(src1f[x]);
+                        dst1[x*2+1] = saturate_cast<short>(src2f[x]);
+                    }
                 }
+            }
             else
-                for( x = 0; x < size.width; x++ )
+            {
+                #if CV_TRY_SSE4_1
+                if (useSSE4_1)
+                    opt_SSE4_1::convertMaps_32f1c16s_SSE41(src1f, src2f, dst1, dst2, size.width);
+                else
+                #endif
                 {
-                    int ix = saturate_cast<int>(src1f[x]*INTER_TAB_SIZE);
-                    int iy = saturate_cast<int>(src2f[x]*INTER_TAB_SIZE);
-                    dst1[x*2] = (short)(ix >> INTER_BITS);
-                    dst1[x*2+1] = (short)(iy >> INTER_BITS);
-                    dst2[x] = (ushort)((iy & (INTER_TAB_SIZE-1))*INTER_TAB_SIZE + (ix & (INTER_TAB_SIZE-1)));
+                    #if CV_SIMD128
+                    {
+                        v_float32x4 v_scale = v_setall_f32((float)INTER_TAB_SIZE);
+                        v_int32x4 v_mask = v_setall_s32(INTER_TAB_SIZE - 1);
+                        v_int32x4 v_scale3 = v_setall_s32(INTER_TAB_SIZE);
+                        int span = v_float32x4::nlanes;
+                        for( ; x <= size.width - span * 2; x += span * 2 )
+                        {
+                            v_int32x4 v_ix0 = v_round(v_scale * (v_load(src1f + x)));
+                            v_int32x4 v_ix1 = v_round(v_scale * (v_load(src1f + x + span)));
+                            v_int32x4 v_iy0 = v_round(v_scale * (v_load(src2f + x)));
+                            v_int32x4 v_iy1 = v_round(v_scale * (v_load(src2f + x + span)));
+
+                            v_int16x8 v_dst[2];
+                            v_dst[0] = v_pack(v_shr<INTER_BITS>(v_ix0), v_shr<INTER_BITS>(v_ix1));
+                            v_dst[1] = v_pack(v_shr<INTER_BITS>(v_iy0), v_shr<INTER_BITS>(v_iy1));
+                            v_store_interleave(dst1 + (x << 1), v_dst[0], v_dst[1]);
+
+                            v_int32x4 v_dst0 = v_muladd(v_scale3, (v_iy0 & v_mask), (v_ix0 & v_mask));
+                            v_int32x4 v_dst1 = v_muladd(v_scale3, (v_iy1 & v_mask), (v_ix1 & v_mask));
+                            v_store(dst2 + x, v_pack_u(v_dst0, v_dst1));
+                        }
+                    }
+                    #endif
+                    for( ; x < size.width; x++ )
+                    {
+                        int ix = saturate_cast<int>(src1f[x]*INTER_TAB_SIZE);
+                        int iy = saturate_cast<int>(src2f[x]*INTER_TAB_SIZE);
+                        dst1[x*2] = saturate_cast<short>(ix >> INTER_BITS);
+                        dst1[x*2+1] = saturate_cast<short>(iy >> INTER_BITS);
+                        dst2[x] = (ushort)((iy & (INTER_TAB_SIZE-1))*INTER_TAB_SIZE + (ix & (INTER_TAB_SIZE-1)));
+                    }
                 }
+            }
         }
         else if( m1type == CV_32FC2 && dstm1type == CV_16SC2 )
         {
             if( nninterpolate )
-                for( x = 0; x < size.width; x++ )
+            {
+                #if CV_SIMD128
+                int span = v_float32x4::nlanes;
+                {
+                    for( ; x <= (size.width << 1) - span * 2; x += span * 2 )
+                        v_store(dst1 + x, v_pack(v_round(v_load(src1f + x)),
+                                                 v_round(v_load(src1f + x + span))));
+                }
+                #endif
+                for( ; x < size.width; x++ )
                 {
                     dst1[x*2] = saturate_cast<short>(src1f[x*2]);
                     dst1[x*2+1] = saturate_cast<short>(src1f[x*2+1]);
                 }
+            }
             else
-                for( x = 0; x < size.width; x++ )
+            {
+                #if CV_TRY_SSE4_1
+                if( useSSE4_1 )
+                    opt_SSE4_1::convertMaps_32f2c16s_SSE41(src1f, dst1, dst2, size.width);
+                else
+                #endif
                 {
-                    int ix = saturate_cast<int>(src1f[x*2]*INTER_TAB_SIZE);
-                    int iy = saturate_cast<int>(src1f[x*2+1]*INTER_TAB_SIZE);
-                    dst1[x*2] = (short)(ix >> INTER_BITS);
-                    dst1[x*2+1] = (short)(iy >> INTER_BITS);
-                    dst2[x] = (ushort)((iy & (INTER_TAB_SIZE-1))*INTER_TAB_SIZE + (ix & (INTER_TAB_SIZE-1)));
+                    #if CV_SIMD128
+                    {
+                        v_float32x4 v_scale = v_setall_f32((float)INTER_TAB_SIZE);
+                        v_int32x4 v_mask = v_setall_s32(INTER_TAB_SIZE - 1);
+                        v_int32x4 v_scale3 = v_setall_s32(INTER_TAB_SIZE);
+                        int span = v_uint16x8::nlanes;
+                        for (; x <= size.width - span; x += span )
+                        {
+                            v_float32x4 v_src0[2], v_src1[2];
+                            v_load_deinterleave(src1f + (x << 1), v_src0[0], v_src0[1]);
+                            v_load_deinterleave(src1f + (x << 1) + span, v_src1[0], v_src1[1]);
+                            v_int32x4 v_ix0 = v_round(v_src0[0] * v_scale);
+                            v_int32x4 v_ix1 = v_round(v_src1[0] * v_scale);
+                            v_int32x4 v_iy0 = v_round(v_src0[1] * v_scale);
+                            v_int32x4 v_iy1 = v_round(v_src1[1] * v_scale);
+
+                            v_int16x8 v_dst[2];
+                            v_dst[0] = v_pack(v_shr<INTER_BITS>(v_ix0), v_shr<INTER_BITS>(v_ix1));
+                            v_dst[1] = v_pack(v_shr<INTER_BITS>(v_iy0), v_shr<INTER_BITS>(v_iy1));
+                            v_store_interleave(dst1 + (x << 1), v_dst[0], v_dst[1]);
+
+                            v_store(dst2 + x, v_pack_u(
+                                v_muladd(v_scale3, (v_iy0 & v_mask), (v_ix0 & v_mask)),
+                                v_muladd(v_scale3, (v_iy1 & v_mask), (v_ix1 & v_mask))));
+                        }
+                    }
+                    #endif
+                    for( ; x < size.width; x++ )
+                    {
+                        int ix = saturate_cast<int>(src1f[x*2]*INTER_TAB_SIZE);
+                        int iy = saturate_cast<int>(src1f[x*2+1]*INTER_TAB_SIZE);
+                        dst1[x*2] = saturate_cast<short>(ix >> INTER_BITS);
+                        dst1[x*2+1] = saturate_cast<short>(iy >> INTER_BITS);
+                        dst2[x] = (ushort)((iy & (INTER_TAB_SIZE-1))*INTER_TAB_SIZE + (ix & (INTER_TAB_SIZE-1)));
+                    }
                 }
+            }
         }
         else if( m1type == CV_16SC2 && dstm1type == CV_32FC1 )
         {
-            for( x = 0; x < size.width; x++ )
+            #if CV_SIMD128
             {
-                int fxy = src2 ? src2[x] : 0;
+                v_uint16x8 v_mask2 =  v_setall_u16(INTER_TAB_SIZE2-1);
+                v_uint32x4 v_zero =   v_setzero_u32(), v_mask = v_setall_u32(INTER_TAB_SIZE-1);
+                v_float32x4 v_scale = v_setall_f32(scale);
+                int span = v_float32x4::nlanes;
+                for( ; x <= size.width - span * 2; x += span * 2 )
+                {
+                    v_uint32x4 v_fxy1, v_fxy2;
+                    if ( src2 )
+                    {
+                        v_uint16x8 v_src2 = v_load(src2 + x) & v_mask2;
+                        v_expand(v_src2, v_fxy1, v_fxy2);
+                    }
+                    else
+                        v_fxy1 = v_fxy2 = v_zero;
+
+                    v_int16x8 v_src[2];
+                    v_int32x4 v_src0[2], v_src1[2];
+                    v_load_deinterleave(src1 + (x << 1), v_src[0], v_src[1]);
+                    v_expand(v_src[0], v_src0[0], v_src0[1]);
+                    v_expand(v_src[1], v_src1[0], v_src1[1]);
+                    #define CV_COMPUTE_MAP_X(X, FXY)  v_muladd(v_scale, v_cvt_f32(v_reinterpret_as_s32((FXY) & v_mask)),\
+                                                                        v_cvt_f32(v_reinterpret_as_s32(X)))
+                    #define CV_COMPUTE_MAP_Y(Y, FXY)  v_muladd(v_scale, v_cvt_f32(v_reinterpret_as_s32((FXY) >> INTER_BITS)),\
+                                                                        v_cvt_f32(v_reinterpret_as_s32(Y)))
+                    v_float32x4 v_dst1 = CV_COMPUTE_MAP_X(v_src0[0], v_fxy1);
+                    v_float32x4 v_dst2 = CV_COMPUTE_MAP_Y(v_src1[0], v_fxy1);
+                    v_store(dst1f + x, v_dst1);
+                    v_store(dst2f + x, v_dst2);
+
+                    v_dst1 = CV_COMPUTE_MAP_X(v_src0[1], v_fxy2);
+                    v_dst2 = CV_COMPUTE_MAP_Y(v_src1[1], v_fxy2);
+                    v_store(dst1f + x + span, v_dst1);
+                    v_store(dst2f + x + span, v_dst2);
+                    #undef CV_COMPUTE_MAP_X
+                    #undef CV_COMPUTE_MAP_Y
+                }
+            }
+            #endif
+            for( ; x < size.width; x++ )
+            {
+                int fxy = src2 ? src2[x] & (INTER_TAB_SIZE2-1) : 0;
                 dst1f[x] = src1[x*2] + (fxy & (INTER_TAB_SIZE-1))*scale;
                 dst2f[x] = src1[x*2+1] + (fxy >> INTER_BITS)*scale;
             }
         }
         else if( m1type == CV_16SC2 && dstm1type == CV_32FC2 )
         {
-            for( x = 0; x < size.width; x++ )
+            #if CV_SIMD128
             {
-                int fxy = src2 ? src2[x] : 0;
+                v_int16x8 v_mask2 = v_setall_s16(INTER_TAB_SIZE2-1);
+                v_int32x4 v_zero = v_setzero_s32(), v_mask = v_setall_s32(INTER_TAB_SIZE-1);
+                v_float32x4 v_scale = v_setall_f32(scale);
+                int span = v_int16x8::nlanes;
+                for( ; x <= size.width - span; x += span )
+                {
+                    v_int32x4 v_fxy1, v_fxy2;
+                    if (src2)
+                    {
+                        v_int16x8 v_src2 = v_load((short *)src2 + x) & v_mask2;
+                        v_expand(v_src2, v_fxy1, v_fxy2);
+                    }
+                    else
+                        v_fxy1 = v_fxy2 = v_zero;
+
+                    v_int16x8 v_src[2];
+                    v_int32x4 v_src0[2], v_src1[2];
+                    v_float32x4 v_dst[2];
+                    v_load_deinterleave(src1 + (x << 1), v_src[0], v_src[1]);
+                    v_expand(v_src[0], v_src0[0], v_src0[1]);
+                    v_expand(v_src[1], v_src1[0], v_src1[1]);
+
+                    #define CV_COMPUTE_MAP_X(X, FXY) v_muladd(v_scale, v_cvt_f32((FXY) & v_mask), v_cvt_f32(X))
+                    #define CV_COMPUTE_MAP_Y(Y, FXY) v_muladd(v_scale, v_cvt_f32((FXY) >> INTER_BITS), v_cvt_f32(Y))
+                    v_dst[0] = CV_COMPUTE_MAP_X(v_src0[0], v_fxy1);
+                    v_dst[1] = CV_COMPUTE_MAP_Y(v_src1[0], v_fxy1);
+                    v_store_interleave(dst1f + (x << 1), v_dst[0], v_dst[1]);
+
+                    v_dst[0] = CV_COMPUTE_MAP_X(v_src0[1], v_fxy2);
+                    v_dst[1] = CV_COMPUTE_MAP_Y(v_src1[1], v_fxy2);
+                    v_store_interleave(dst1f + (x << 1) + span, v_dst[0], v_dst[1]);
+                    #undef CV_COMPUTE_MAP_X
+                    #undef CV_COMPUTE_MAP_Y
+                }
+            }
+            #endif
+            for( ; x < size.width; x++ )
+            {
+                int fxy = src2 ? src2[x] & (INTER_TAB_SIZE2-1): 0;
                 dst1f[x*2] = src1[x*2] + (fxy & (INTER_TAB_SIZE-1))*scale;
                 dst1f[x*2+1] = src1[x*2+1] + (fxy >> INTER_BITS)*scale;
             }
@@ -3138,27 +2152,31 @@ void cv::convertMaps( InputArray _map1, InputArray _map2,
 namespace cv
 {
 
-class warpAffineInvoker :
+class WarpAffineInvoker :
     public ParallelLoopBody
 {
 public:
-    warpAffineInvoker(const Mat &_src, Mat &_dst, int _interpolation, int _borderType,
-                      const Scalar &_borderValue, int *_adelta, int *_bdelta, double *_M) :
+    WarpAffineInvoker(const Mat &_src, Mat &_dst, int _interpolation, int _borderType,
+                      const Scalar &_borderValue, int *_adelta, int *_bdelta, const double *_M) :
         ParallelLoopBody(), src(_src), dst(_dst), interpolation(_interpolation),
         borderType(_borderType), borderValue(_borderValue), adelta(_adelta), bdelta(_bdelta),
         M(_M)
     {
     }
 
-    virtual void operator() (const Range& range) const
+    virtual void operator() (const Range& range) const CV_OVERRIDE
     {
         const int BLOCK_SZ = 64;
-        short XY[BLOCK_SZ*BLOCK_SZ*2], A[BLOCK_SZ*BLOCK_SZ];
+        AutoBuffer<short, 0> __XY(BLOCK_SZ * BLOCK_SZ * 2), __A(BLOCK_SZ * BLOCK_SZ);
+        short *XY = __XY.data(), *A = __A.data();
         const int AB_BITS = MAX(10, (int)INTER_BITS);
         const int AB_SCALE = 1 << AB_BITS;
         int round_delta = interpolation == INTER_NEAREST ? AB_SCALE/2 : AB_SCALE/INTER_TAB_SIZE/2, x, y, x1, y1;
-    #if CV_SSE2
-        bool useSIMD = checkHardwareSupport(CV_CPU_SSE2);
+    #if CV_TRY_AVX2
+        bool useAVX2 = CV_CPU_HAS_SUPPORT_AVX2;
+    #endif
+    #if CV_TRY_SSE4_1
+        bool useSSE4_1 = CV_CPU_HAS_SUPPORT_SSE4_1;
     #endif
 
         int bh0 = std::min(BLOCK_SZ/2, dst.rows);
@@ -3182,51 +2200,70 @@ public:
                     int Y0 = saturate_cast<int>((M[4]*(y + y1) + M[5])*AB_SCALE) + round_delta;
 
                     if( interpolation == INTER_NEAREST )
-                        for( x1 = 0; x1 < bw; x1++ )
+                    {
+                        x1 = 0;
+                        #if CV_TRY_SSE4_1
+                        if( useSSE4_1 )
+                            opt_SSE4_1::WarpAffineInvoker_Blockline_SSE41(adelta + x, bdelta + x, xy, X0, Y0, bw);
+                        else
+                        #endif
                         {
-                            int X = (X0 + adelta[x+x1]) >> AB_BITS;
-                            int Y = (Y0 + bdelta[x+x1]) >> AB_BITS;
-                            xy[x1*2] = saturate_cast<short>(X);
-                            xy[x1*2+1] = saturate_cast<short>(Y);
+                            #if CV_SIMD128
+                            {
+                                v_int32x4 v_X0 = v_setall_s32(X0), v_Y0 = v_setall_s32(Y0);
+                                int span = v_uint16x8::nlanes;
+                                for( ; x1 <= bw - span; x1 += span )
+                                {
+                                    v_int16x8 v_dst[2];
+                                    #define CV_CONVERT_MAP(ptr,offset,shift) v_pack(v_shr<AB_BITS>(shift+v_load(ptr + offset)),\
+                                                                                    v_shr<AB_BITS>(shift+v_load(ptr + offset + 4)))
+                                    v_dst[0] = CV_CONVERT_MAP(adelta, x+x1, v_X0);
+                                    v_dst[1] = CV_CONVERT_MAP(bdelta, x+x1, v_Y0);
+                                    #undef CV_CONVERT_MAP
+                                    v_store_interleave(xy + (x1 << 1), v_dst[0], v_dst[1]);
+                                }
+                            }
+                            #endif
+                            for( ; x1 < bw; x1++ )
+                            {
+                                int X = (X0 + adelta[x+x1]) >> AB_BITS;
+                                int Y = (Y0 + bdelta[x+x1]) >> AB_BITS;
+                                xy[x1*2] = saturate_cast<short>(X);
+                                xy[x1*2+1] = saturate_cast<short>(Y);
+                            }
                         }
+                    }
                     else
                     {
                         short* alpha = A + y1*bw;
                         x1 = 0;
-                    #if CV_SSE2
-                        if( useSIMD )
+                        #if CV_TRY_AVX2
+                        if ( useAVX2 )
+                            x1 = opt_AVX2::warpAffineBlockline(adelta + x, bdelta + x, xy, alpha, X0, Y0, bw);
+                        #endif
+                        #if CV_SIMD128
                         {
-                            __m128i fxy_mask = _mm_set1_epi32(INTER_TAB_SIZE - 1);
-                            __m128i XX = _mm_set1_epi32(X0), YY = _mm_set1_epi32(Y0);
-                            for( ; x1 <= bw - 8; x1 += 8 )
+                            v_int32x4 v__X0 = v_setall_s32(X0), v__Y0 = v_setall_s32(Y0);
+                            v_int32x4 v_mask = v_setall_s32(INTER_TAB_SIZE - 1);
+                            int span = v_float32x4::nlanes;
+                            for( ; x1 <= bw - span * 2; x1 += span * 2 )
                             {
-                                __m128i tx0, tx1, ty0, ty1;
-                                tx0 = _mm_add_epi32(_mm_loadu_si128((const __m128i*)(adelta + x + x1)), XX);
-                                ty0 = _mm_add_epi32(_mm_loadu_si128((const __m128i*)(bdelta + x + x1)), YY);
-                                tx1 = _mm_add_epi32(_mm_loadu_si128((const __m128i*)(adelta + x + x1 + 4)), XX);
-                                ty1 = _mm_add_epi32(_mm_loadu_si128((const __m128i*)(bdelta + x + x1 + 4)), YY);
+                                v_int32x4 v_X0 = v_shr<AB_BITS - INTER_BITS>(v__X0 + v_load(adelta + x + x1));
+                                v_int32x4 v_Y0 = v_shr<AB_BITS - INTER_BITS>(v__Y0 + v_load(bdelta + x + x1));
+                                v_int32x4 v_X1 = v_shr<AB_BITS - INTER_BITS>(v__X0 + v_load(adelta + x + x1 + span));
+                                v_int32x4 v_Y1 = v_shr<AB_BITS - INTER_BITS>(v__Y0 + v_load(bdelta + x + x1 + span));
 
-                                tx0 = _mm_srai_epi32(tx0, AB_BITS - INTER_BITS);
-                                ty0 = _mm_srai_epi32(ty0, AB_BITS - INTER_BITS);
-                                tx1 = _mm_srai_epi32(tx1, AB_BITS - INTER_BITS);
-                                ty1 = _mm_srai_epi32(ty1, AB_BITS - INTER_BITS);
+                                v_int16x8 v_xy[2];
+                                v_xy[0] = v_pack(v_shr<INTER_BITS>(v_X0), v_shr<INTER_BITS>(v_X1));
+                                v_xy[1] = v_pack(v_shr<INTER_BITS>(v_Y0), v_shr<INTER_BITS>(v_Y1));
+                                v_store_interleave(xy + (x1 << 1), v_xy[0], v_xy[1]);
 
-                                __m128i fx_ = _mm_packs_epi32(_mm_and_si128(tx0, fxy_mask),
-                                                            _mm_and_si128(tx1, fxy_mask));
-                                __m128i fy_ = _mm_packs_epi32(_mm_and_si128(ty0, fxy_mask),
-                                                            _mm_and_si128(ty1, fxy_mask));
-                                tx0 = _mm_packs_epi32(_mm_srai_epi32(tx0, INTER_BITS),
-                                                            _mm_srai_epi32(tx1, INTER_BITS));
-                                ty0 = _mm_packs_epi32(_mm_srai_epi32(ty0, INTER_BITS),
-                                                    _mm_srai_epi32(ty1, INTER_BITS));
-                                fx_ = _mm_adds_epi16(fx_, _mm_slli_epi16(fy_, INTER_BITS));
-
-                                _mm_storeu_si128((__m128i*)(xy + x1*2), _mm_unpacklo_epi16(tx0, ty0));
-                                _mm_storeu_si128((__m128i*)(xy + x1*2 + 8), _mm_unpackhi_epi16(tx0, ty0));
-                                _mm_storeu_si128((__m128i*)(alpha + x1), fx_);
+                                v_int32x4 v_alpha0 = v_shl<INTER_BITS>(v_Y0 & v_mask) | (v_X0 & v_mask);
+                                v_int32x4 v_alpha1 = v_shl<INTER_BITS>(v_Y1 & v_mask) | (v_X1 & v_mask);
+                                v_store(alpha + x1, v_pack(v_alpha0, v_alpha1));
                             }
                         }
-                    #endif
+                        #endif
                         for( ; x1 < bw; x1++ )
                         {
                             int X = (X0 + adelta[x+x1]) >> (AB_BITS - INTER_BITS);
@@ -3256,48 +2293,259 @@ private:
     int interpolation, borderType;
     Scalar borderValue;
     int *adelta, *bdelta;
-    double *M;
+    const double *M;
 };
 
-}
 
+#if defined (HAVE_IPP) && IPP_VERSION_X100 >= 810 && !IPP_DISABLE_WARPAFFINE
+typedef IppStatus (CV_STDCALL* ippiWarpAffineBackFunc)(const void*, IppiSize, int, IppiRect, void *, int, IppiRect, double [2][3], int);
 
-void cv::warpAffine( InputArray _src, OutputArray _dst,
-                     InputArray _M0, Size dsize,
-                     int flags, int borderType, const Scalar& borderValue )
+class IPPWarpAffineInvoker :
+    public ParallelLoopBody
 {
-    Mat src = _src.getMat(), M0 = _M0.getMat();
-    _dst.create( dsize.area() == 0 ? src.size() : dsize, src.type() );
-    Mat dst = _dst.getMat();
-    CV_Assert( src.cols > 0 && src.rows > 0 );
-    if( dst.data == src.data )
-        src = src.clone();
+public:
+    IPPWarpAffineInvoker(Mat &_src, Mat &_dst, double (&_coeffs)[2][3], int &_interpolation, int _borderType,
+                         const Scalar &_borderValue, ippiWarpAffineBackFunc _func, bool *_ok) :
+        ParallelLoopBody(), src(_src), dst(_dst), mode(_interpolation), coeffs(_coeffs),
+        borderType(_borderType), borderValue(_borderValue), func(_func), ok(_ok)
+    {
+        *ok = true;
+    }
 
-    double M[6];
-    Mat matM(2, 3, CV_64F, M);
+    virtual void operator() (const Range& range) const CV_OVERRIDE
+    {
+        IppiSize srcsize = { src.cols, src.rows };
+        IppiRect srcroi = { 0, 0, src.cols, src.rows };
+        IppiRect dstroi = { 0, range.start, dst.cols, range.end - range.start };
+        int cnn = src.channels();
+        if( borderType == BORDER_CONSTANT )
+        {
+            IppiSize setSize = { dst.cols, range.end - range.start };
+            void *dataPointer = dst.ptr(range.start);
+            if( !IPPSet( borderValue, dataPointer, (int)dst.step[0], setSize, cnn, src.depth() ) )
+            {
+                *ok = false;
+                return;
+            }
+        }
+
+        // Aug 2013: problem in IPP 7.1, 8.0 : sometimes function return ippStsCoeffErr
+        IppStatus status = CV_INSTRUMENT_FUN_IPP(func,( src.ptr(), srcsize, (int)src.step[0], srcroi, dst.ptr(),
+                                (int)dst.step[0], dstroi, coeffs, mode ));
+        if( status < 0)
+            *ok = false;
+        else
+        {
+            CV_IMPL_ADD(CV_IMPL_IPP|CV_IMPL_MT);
+        }
+    }
+private:
+    Mat &src;
+    Mat &dst;
+    int mode;
+    double (&coeffs)[2][3];
+    int borderType;
+    Scalar borderValue;
+    ippiWarpAffineBackFunc func;
+    bool *ok;
+    const IPPWarpAffineInvoker& operator= (const IPPWarpAffineInvoker&);
+};
+#endif
+
+#ifdef HAVE_OPENCL
+
+enum { OCL_OP_PERSPECTIVE = 1, OCL_OP_AFFINE = 0 };
+
+static bool ocl_warpTransform_cols4(InputArray _src, OutputArray _dst, InputArray _M0,
+                                    Size dsize, int flags, int borderType, const Scalar& borderValue,
+                                    int op_type)
+{
+    CV_Assert(op_type == OCL_OP_AFFINE || op_type == OCL_OP_PERSPECTIVE);
+    const ocl::Device & dev = ocl::Device::getDefault();
+    int type = _src.type(), dtype = _dst.type(), depth = CV_MAT_DEPTH(type), cn = CV_MAT_CN(type);
+
     int interpolation = flags & INTER_MAX;
     if( interpolation == INTER_AREA )
         interpolation = INTER_LINEAR;
 
-    CV_Assert( (M0.type() == CV_32F || M0.type() == CV_64F) && M0.rows == 2 && M0.cols == 3 );
-    M0.convertTo(matM, matM.type());
+    if ( !dev.isIntel() || !(type == CV_8UC1) ||
+         !(dtype == CV_8UC1) || !(_dst.cols() % 4 == 0) ||
+         !(borderType == cv::BORDER_CONSTANT &&
+          (interpolation == cv::INTER_NEAREST || interpolation == cv::INTER_LINEAR || interpolation == cv::INTER_CUBIC)))
+        return false;
 
-#ifdef HAVE_TEGRA_OPTIMIZATION
-    if( tegra::warpAffine(src, dst, M, flags, borderType, borderValue) )
-        return;
-#endif
+    const char * const warp_op[2] = { "Affine", "Perspective" };
+    const char * const interpolationMap[3] = { "nearest", "linear", "cubic" };
+    ocl::ProgramSource program = ocl::imgproc::warp_transform_oclsrc;
+    String kernelName = format("warp%s_%s_8u", warp_op[op_type], interpolationMap[interpolation]);
+
+    bool is32f = (interpolation == INTER_CUBIC || interpolation == INTER_LINEAR) && op_type == OCL_OP_AFFINE;
+    int wdepth = interpolation == INTER_NEAREST ? depth : std::max(is32f ? CV_32F : CV_32S, depth);
+    int sctype = CV_MAKETYPE(wdepth, cn);
+
+    ocl::Kernel k;
+    String opts = format("-D ST=%s", ocl::typeToStr(sctype));
+
+    k.create(kernelName.c_str(), program, opts);
+    if (k.empty())
+        return false;
+
+    float borderBuf[] = { 0, 0, 0, 0 };
+    scalarToRawData(borderValue, borderBuf, sctype);
+
+    UMat src = _src.getUMat(), M0;
+    _dst.create( dsize.empty() ? src.size() : dsize, src.type() );
+    UMat dst = _dst.getUMat();
+
+    float M[9] = {0};
+    int matRows = (op_type == OCL_OP_AFFINE ? 2 : 3);
+    Mat matM(matRows, 3, CV_32F, M), M1 = _M0.getMat();
+    CV_Assert( (M1.type() == CV_32F || M1.type() == CV_64F) && M1.rows == matRows && M1.cols == 3 );
+    M1.convertTo(matM, matM.type());
 
     if( !(flags & WARP_INVERSE_MAP) )
     {
-        double D = M[0]*M[4] - M[1]*M[3];
-        D = D != 0 ? 1./D : 0;
-        double A11 = M[4]*D, A22=M[0]*D;
-        M[0] = A11; M[1] *= -D;
-        M[3] *= -D; M[4] = A22;
-        double b1 = -M[0]*M[2] - M[1]*M[5];
-        double b2 = -M[3]*M[2] - M[4]*M[5];
-        M[2] = b1; M[5] = b2;
+        if (op_type == OCL_OP_PERSPECTIVE)
+            invert(matM, matM);
+        else
+        {
+            float D = M[0]*M[4] - M[1]*M[3];
+            D = D != 0 ? 1.f/D : 0;
+            float A11 = M[4]*D, A22=M[0]*D;
+            M[0] = A11; M[1] *= -D;
+            M[3] *= -D; M[4] = A22;
+            float b1 = -M[0]*M[2] - M[1]*M[5];
+            float b2 = -M[3]*M[2] - M[4]*M[5];
+            M[2] = b1; M[5] = b2;
+        }
     }
+    matM.convertTo(M0, CV_32F);
+
+    k.args(ocl::KernelArg::ReadOnly(src), ocl::KernelArg::WriteOnly(dst), ocl::KernelArg::PtrReadOnly(M0),
+           ocl::KernelArg(ocl::KernelArg::CONSTANT, 0, 0, 0, borderBuf, CV_ELEM_SIZE(sctype)));
+
+    size_t globalThreads[2];
+    globalThreads[0] = (size_t)(dst.cols / 4);
+    globalThreads[1] = (size_t)dst.rows;
+
+    return k.run(2, globalThreads, NULL, false);
+}
+
+static bool ocl_warpTransform(InputArray _src, OutputArray _dst, InputArray _M0,
+                              Size dsize, int flags, int borderType, const Scalar& borderValue,
+                              int op_type)
+{
+    CV_Assert(op_type == OCL_OP_AFFINE || op_type == OCL_OP_PERSPECTIVE);
+    const ocl::Device & dev = ocl::Device::getDefault();
+
+    int type = _src.type(), depth = CV_MAT_DEPTH(type), cn = CV_MAT_CN(type);
+    const bool doubleSupport = dev.doubleFPConfig() > 0;
+
+    int interpolation = flags & INTER_MAX;
+    if( interpolation == INTER_AREA )
+        interpolation = INTER_LINEAR;
+    int rowsPerWI = dev.isIntel() && op_type == OCL_OP_AFFINE && interpolation <= INTER_LINEAR ? 4 : 1;
+
+    if ( !(borderType == cv::BORDER_CONSTANT &&
+           (interpolation == cv::INTER_NEAREST || interpolation == cv::INTER_LINEAR || interpolation == cv::INTER_CUBIC)) ||
+         (!doubleSupport && depth == CV_64F) || cn > 4)
+        return false;
+
+    bool useDouble = depth == CV_64F;
+
+    const char * const interpolationMap[3] = { "NEAREST", "LINEAR", "CUBIC" };
+    ocl::ProgramSource program = op_type == OCL_OP_AFFINE ?
+                ocl::imgproc::warp_affine_oclsrc : ocl::imgproc::warp_perspective_oclsrc;
+    const char * const kernelName = op_type == OCL_OP_AFFINE ? "warpAffine" : "warpPerspective";
+
+    int scalarcn = cn == 3 ? 4 : cn;
+    bool is32f = !dev.isAMD() && (interpolation == INTER_CUBIC || interpolation == INTER_LINEAR) && op_type == OCL_OP_AFFINE;
+    int wdepth = interpolation == INTER_NEAREST ? depth : std::max(is32f ? CV_32F : CV_32S, depth);
+    int sctype = CV_MAKETYPE(wdepth, scalarcn);
+
+    ocl::Kernel k;
+    String opts;
+    if (interpolation == INTER_NEAREST)
+    {
+        opts = format("-D INTER_NEAREST -D T=%s%s -D CT=%s -D T1=%s -D ST=%s -D cn=%d -D rowsPerWI=%d",
+                      ocl::typeToStr(type),
+                      doubleSupport ? " -D DOUBLE_SUPPORT" : "",
+                      useDouble ? "double" : "float",
+                      ocl::typeToStr(CV_MAT_DEPTH(type)),
+                      ocl::typeToStr(sctype), cn, rowsPerWI);
+    }
+    else
+    {
+        char cvt[2][50];
+        opts = format("-D INTER_%s -D T=%s -D T1=%s -D ST=%s -D WT=%s -D depth=%d"
+                      " -D convertToWT=%s -D convertToT=%s%s -D CT=%s -D cn=%d -D rowsPerWI=%d",
+                      interpolationMap[interpolation], ocl::typeToStr(type),
+                      ocl::typeToStr(CV_MAT_DEPTH(type)),
+                      ocl::typeToStr(sctype),
+                      ocl::typeToStr(CV_MAKE_TYPE(wdepth, cn)), depth,
+                      ocl::convertTypeStr(depth, wdepth, cn, cvt[0]),
+                      ocl::convertTypeStr(wdepth, depth, cn, cvt[1]),
+                      doubleSupport ? " -D DOUBLE_SUPPORT" : "",
+                      useDouble ? "double" : "float",
+                      cn, rowsPerWI);
+    }
+
+    k.create(kernelName, program, opts);
+    if (k.empty())
+        return false;
+
+    double borderBuf[] = { 0, 0, 0, 0 };
+    scalarToRawData(borderValue, borderBuf, sctype);
+
+    UMat src = _src.getUMat(), M0;
+    _dst.create( dsize.empty() ? src.size() : dsize, src.type() );
+    UMat dst = _dst.getUMat();
+
+    double M[9] = {0};
+    int matRows = (op_type == OCL_OP_AFFINE ? 2 : 3);
+    Mat matM(matRows, 3, CV_64F, M), M1 = _M0.getMat();
+    CV_Assert( (M1.type() == CV_32F || M1.type() == CV_64F) &&
+               M1.rows == matRows && M1.cols == 3 );
+    M1.convertTo(matM, matM.type());
+
+    if( !(flags & WARP_INVERSE_MAP) )
+    {
+        if (op_type == OCL_OP_PERSPECTIVE)
+            invert(matM, matM);
+        else
+        {
+            double D = M[0]*M[4] - M[1]*M[3];
+            D = D != 0 ? 1./D : 0;
+            double A11 = M[4]*D, A22=M[0]*D;
+            M[0] = A11; M[1] *= -D;
+            M[3] *= -D; M[4] = A22;
+            double b1 = -M[0]*M[2] - M[1]*M[5];
+            double b2 = -M[3]*M[2] - M[4]*M[5];
+            M[2] = b1; M[5] = b2;
+        }
+    }
+    matM.convertTo(M0, useDouble ? CV_64F : CV_32F);
+
+    k.args(ocl::KernelArg::ReadOnly(src), ocl::KernelArg::WriteOnly(dst), ocl::KernelArg::PtrReadOnly(M0),
+           ocl::KernelArg(ocl::KernelArg::CONSTANT, 0, 0, 0, borderBuf, CV_ELEM_SIZE(sctype)));
+
+    size_t globalThreads[2] = { (size_t)dst.cols, ((size_t)dst.rows + rowsPerWI - 1) / rowsPerWI };
+    return k.run(2, globalThreads, NULL, false);
+}
+
+#endif
+
+namespace hal {
+
+void warpAffine(int src_type,
+                const uchar * src_data, size_t src_step, int src_width, int src_height,
+                uchar * dst_data, size_t dst_step, int dst_width, int dst_height,
+                const double M[6], int interpolation, int borderType, const double borderValue[4])
+{
+    CALL_HAL(warpAffine, cv_hal_warpAffine, src_type, src_data, src_step, src_width, src_height, dst_data, dst_step, dst_width, dst_height, M, interpolation, borderType, borderValue);
+
+    Mat src(Size(src_width, src_height), src_type, const_cast<uchar*>(src_data), src_step);
+    Mat dst(Size(dst_width, dst_height), src_type, dst_data, dst_step);
 
     int x;
     AutoBuffer<int> _abdelta(dst.cols*2);
@@ -3312,36 +2560,417 @@ void cv::warpAffine( InputArray _src, OutputArray _dst,
     }
 
     Range range(0, dst.rows);
-    warpAffineInvoker invoker(src, dst, interpolation, borderType,
-                              borderValue, adelta, bdelta, M);
+    WarpAffineInvoker invoker(src, dst, interpolation, borderType,
+                              Scalar(borderValue[0], borderValue[1], borderValue[2], borderValue[3]),
+                              adelta, bdelta, M);
     parallel_for_(range, invoker, dst.total()/(double)(1<<16));
+}
+
+} // hal::
+} // cv::
+
+
+void cv::warpAffine( InputArray _src, OutputArray _dst,
+                     InputArray _M0, Size dsize,
+                     int flags, int borderType, const Scalar& borderValue )
+{
+    CV_INSTRUMENT_REGION();
+
+    int interpolation = flags & INTER_MAX;
+    CV_Assert( _src.channels() <= 4 || (interpolation != INTER_LANCZOS4 &&
+                                        interpolation != INTER_CUBIC) );
+
+    CV_OCL_RUN(_src.dims() <= 2 && _dst.isUMat() &&
+               _src.cols() <= SHRT_MAX && _src.rows() <= SHRT_MAX,
+               ocl_warpTransform_cols4(_src, _dst, _M0, dsize, flags, borderType,
+                                       borderValue, OCL_OP_AFFINE))
+
+    CV_OCL_RUN(_src.dims() <= 2 && _dst.isUMat(),
+               ocl_warpTransform(_src, _dst, _M0, dsize, flags, borderType,
+                                 borderValue, OCL_OP_AFFINE))
+
+    Mat src = _src.getMat(), M0 = _M0.getMat();
+    _dst.create( dsize.empty() ? src.size() : dsize, src.type() );
+    Mat dst = _dst.getMat();
+    CV_Assert( src.cols > 0 && src.rows > 0 );
+    if( dst.data == src.data )
+        src = src.clone();
+
+    double M[6] = {0};
+    Mat matM(2, 3, CV_64F, M);
+    if( interpolation == INTER_AREA )
+        interpolation = INTER_LINEAR;
+
+    CV_Assert( (M0.type() == CV_32F || M0.type() == CV_64F) && M0.rows == 2 && M0.cols == 3 );
+    M0.convertTo(matM, matM.type());
+
+    if( !(flags & WARP_INVERSE_MAP) )
+    {
+        double D = M[0]*M[4] - M[1]*M[3];
+        D = D != 0 ? 1./D : 0;
+        double A11 = M[4]*D, A22=M[0]*D;
+        M[0] = A11; M[1] *= -D;
+        M[3] *= -D; M[4] = A22;
+        double b1 = -M[0]*M[2] - M[1]*M[5];
+        double b2 = -M[3]*M[2] - M[4]*M[5];
+        M[2] = b1; M[5] = b2;
+    }
+
+#if defined (HAVE_IPP) && IPP_VERSION_X100 >= 810 && !IPP_DISABLE_WARPAFFINE
+    CV_IPP_CHECK()
+    {
+        int type = src.type(), depth = CV_MAT_DEPTH(type), cn = CV_MAT_CN(type);
+        if( ( depth == CV_8U || depth == CV_16U || depth == CV_32F ) &&
+           ( cn == 1 || cn == 3 || cn == 4 ) &&
+           ( interpolation == INTER_NEAREST || interpolation == INTER_LINEAR || interpolation == INTER_CUBIC) &&
+           ( borderType == cv::BORDER_TRANSPARENT || borderType == cv::BORDER_CONSTANT) )
+        {
+            ippiWarpAffineBackFunc ippFunc = 0;
+            if ((flags & WARP_INVERSE_MAP) != 0)
+            {
+                ippFunc =
+                type == CV_8UC1 ? (ippiWarpAffineBackFunc)ippiWarpAffineBack_8u_C1R :
+                type == CV_8UC3 ? (ippiWarpAffineBackFunc)ippiWarpAffineBack_8u_C3R :
+                type == CV_8UC4 ? (ippiWarpAffineBackFunc)ippiWarpAffineBack_8u_C4R :
+                type == CV_16UC1 ? (ippiWarpAffineBackFunc)ippiWarpAffineBack_16u_C1R :
+                type == CV_16UC3 ? (ippiWarpAffineBackFunc)ippiWarpAffineBack_16u_C3R :
+                type == CV_16UC4 ? (ippiWarpAffineBackFunc)ippiWarpAffineBack_16u_C4R :
+                type == CV_32FC1 ? (ippiWarpAffineBackFunc)ippiWarpAffineBack_32f_C1R :
+                type == CV_32FC3 ? (ippiWarpAffineBackFunc)ippiWarpAffineBack_32f_C3R :
+                type == CV_32FC4 ? (ippiWarpAffineBackFunc)ippiWarpAffineBack_32f_C4R :
+                0;
+            }
+            else
+            {
+                ippFunc =
+                type == CV_8UC1 ? (ippiWarpAffineBackFunc)ippiWarpAffine_8u_C1R :
+                type == CV_8UC3 ? (ippiWarpAffineBackFunc)ippiWarpAffine_8u_C3R :
+                type == CV_8UC4 ? (ippiWarpAffineBackFunc)ippiWarpAffine_8u_C4R :
+                type == CV_16UC1 ? (ippiWarpAffineBackFunc)ippiWarpAffine_16u_C1R :
+                type == CV_16UC3 ? (ippiWarpAffineBackFunc)ippiWarpAffine_16u_C3R :
+                type == CV_16UC4 ? (ippiWarpAffineBackFunc)ippiWarpAffine_16u_C4R :
+                type == CV_32FC1 ? (ippiWarpAffineBackFunc)ippiWarpAffine_32f_C1R :
+                type == CV_32FC3 ? (ippiWarpAffineBackFunc)ippiWarpAffine_32f_C3R :
+                type == CV_32FC4 ? (ippiWarpAffineBackFunc)ippiWarpAffine_32f_C4R :
+                0;
+            }
+            int mode =
+            interpolation == INTER_LINEAR ? IPPI_INTER_LINEAR :
+            interpolation == INTER_NEAREST ? IPPI_INTER_NN :
+            interpolation == INTER_CUBIC ? IPPI_INTER_CUBIC :
+            0;
+            CV_Assert(mode && ippFunc);
+
+            double coeffs[2][3];
+            for( int i = 0; i < 2; i++ )
+                for( int j = 0; j < 3; j++ )
+                    coeffs[i][j] = matM.at<double>(i, j);
+
+            bool ok;
+            Range range(0, dst.rows);
+            IPPWarpAffineInvoker invoker(src, dst, coeffs, mode, borderType, borderValue, ippFunc, &ok);
+            parallel_for_(range, invoker, dst.total()/(double)(1<<16));
+            if( ok )
+            {
+                CV_IMPL_ADD(CV_IMPL_IPP|CV_IMPL_MT);
+                return;
+            }
+            setIppErrorStatus();
+        }
+    }
+#endif
+
+    hal::warpAffine(src.type(), src.data, src.step, src.cols, src.rows, dst.data, dst.step, dst.cols, dst.rows,
+                    M, interpolation, borderType, borderValue.val);
 }
 
 
 namespace cv
 {
+#if CV_SIMD128_64F
+void WarpPerspectiveLine_ProcessNN_CV_SIMD(const double *M, short* xy, double X0, double Y0, double W0, int bw)
+{
+    const v_float64x2 v_M0 = v_setall_f64(M[0]);
+    const v_float64x2 v_M3 = v_setall_f64(M[3]);
+    const v_float64x2 v_M6 = v_setall_f64(M[6]);
+    const v_float64x2 v_intmax = v_setall_f64((double)INT_MAX);
+    const v_float64x2 v_intmin = v_setall_f64((double)INT_MIN);
+    const v_float64x2 v_2 = v_setall_f64(2.0);
+    const v_float64x2 v_zero = v_setzero_f64();
+    const v_float64x2 v_1 = v_setall_f64(1.0);
 
-class warpPerspectiveInvoker :
+    int x1 = 0;
+    v_float64x2 v_X0d = v_setall_f64(X0);
+    v_float64x2 v_Y0d = v_setall_f64(Y0);
+    v_float64x2 v_W0 = v_setall_f64(W0);
+    v_float64x2 v_x1(0.0, 1.0);
+
+    for (; x1 <= bw - 16; x1 += 16)
+    {
+        // 0-3
+        v_int32x4 v_X0, v_Y0;
+        {
+            v_float64x2 v_W = v_muladd(v_M6, v_x1, v_W0);
+            v_W = v_select(v_W != v_zero, v_1 / v_W, v_zero);
+            v_float64x2 v_fX0 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M0, v_x1, v_X0d) * v_W));
+            v_float64x2 v_fY0 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M3, v_x1, v_Y0d) * v_W));
+            v_x1 += v_2;
+
+            v_W = v_muladd(v_M6, v_x1, v_W0);
+            v_W = v_select(v_W != v_zero, v_1 / v_W, v_zero);
+            v_float64x2 v_fX1 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M0, v_x1, v_X0d) * v_W));
+            v_float64x2 v_fY1 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M3, v_x1, v_Y0d) * v_W));
+            v_x1 += v_2;
+
+            v_X0 = v_round(v_fX0, v_fX1);
+            v_Y0 = v_round(v_fY0, v_fY1);
+        }
+
+        // 4-7
+        v_int32x4 v_X1, v_Y1;
+        {
+            v_float64x2 v_W = v_muladd(v_M6, v_x1, v_W0);
+            v_W = v_select(v_W != v_zero, v_1 / v_W, v_zero);
+            v_float64x2 v_fX0 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M0, v_x1, v_X0d) * v_W));
+            v_float64x2 v_fY0 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M3, v_x1, v_Y0d) * v_W));
+            v_x1 += v_2;
+
+            v_W = v_muladd(v_M6, v_x1, v_W0);
+            v_W = v_select(v_W != v_zero, v_1 / v_W, v_zero);
+            v_float64x2 v_fX1 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M0, v_x1, v_X0d) * v_W));
+            v_float64x2 v_fY1 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M3, v_x1, v_Y0d) * v_W));
+            v_x1 += v_2;
+
+            v_X1 = v_round(v_fX0, v_fX1);
+            v_Y1 = v_round(v_fY0, v_fY1);
+        }
+
+        // 8-11
+        v_int32x4 v_X2, v_Y2;
+        {
+            v_float64x2 v_W = v_muladd(v_M6, v_x1, v_W0);
+            v_W = v_select(v_W != v_zero, v_1 / v_W, v_zero);
+            v_float64x2 v_fX0 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M0, v_x1, v_X0d) * v_W));
+            v_float64x2 v_fY0 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M3, v_x1, v_Y0d) * v_W));
+            v_x1 += v_2;
+
+            v_W = v_muladd(v_M6, v_x1, v_W0);
+            v_W = v_select(v_W != v_zero, v_1 / v_W, v_zero);
+            v_float64x2 v_fX1 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M0, v_x1, v_X0d) * v_W));
+            v_float64x2 v_fY1 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M3, v_x1, v_Y0d) * v_W));
+            v_x1 += v_2;
+
+            v_X2 = v_round(v_fX0, v_fX1);
+            v_Y2 = v_round(v_fY0, v_fY1);
+        }
+
+        // 12-15
+        v_int32x4 v_X3, v_Y3;
+        {
+            v_float64x2 v_W = v_muladd(v_M6, v_x1, v_W0);
+            v_W = v_select(v_W != v_zero, v_1 / v_W, v_zero);
+            v_float64x2 v_fX0 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M0, v_x1, v_X0d) * v_W));
+            v_float64x2 v_fY0 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M3, v_x1, v_Y0d) * v_W));
+            v_x1 += v_2;
+
+            v_W = v_muladd(v_M6, v_x1, v_W0);
+            v_W = v_select(v_W != v_zero, v_1 / v_W, v_zero);
+            v_float64x2 v_fX1 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M0, v_x1, v_X0d) * v_W));
+            v_float64x2 v_fY1 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M3, v_x1, v_Y0d) * v_W));
+            v_x1 += v_2;
+
+            v_X3 = v_round(v_fX0, v_fX1);
+            v_Y3 = v_round(v_fY0, v_fY1);
+        }
+
+        // convert to 16s
+        v_X0 = v_reinterpret_as_s32(v_pack(v_X0, v_X1));
+        v_X1 = v_reinterpret_as_s32(v_pack(v_X2, v_X3));
+        v_Y0 = v_reinterpret_as_s32(v_pack(v_Y0, v_Y1));
+        v_Y1 = v_reinterpret_as_s32(v_pack(v_Y2, v_Y3));
+
+        v_store_interleave(xy + x1 * 2, (v_reinterpret_as_s16)(v_X0), (v_reinterpret_as_s16)(v_Y0));
+        v_store_interleave(xy + x1 * 2 + 16, (v_reinterpret_as_s16)(v_X1), (v_reinterpret_as_s16)(v_Y1));
+    }
+
+    for( ; x1 < bw; x1++ )
+    {
+        double W = W0 + M[6]*x1;
+        W = W ? 1./W : 0;
+        double fX = std::max((double)INT_MIN, std::min((double)INT_MAX, (X0 + M[0]*x1)*W));
+        double fY = std::max((double)INT_MIN, std::min((double)INT_MAX, (Y0 + M[3]*x1)*W));
+        int X = saturate_cast<int>(fX);
+        int Y = saturate_cast<int>(fY);
+
+        xy[x1*2] = saturate_cast<short>(X);
+        xy[x1*2+1] = saturate_cast<short>(Y);
+    }
+}
+
+void WarpPerspectiveLine_Process_CV_SIMD(const double *M, short* xy, short* alpha, double X0, double Y0, double W0, int bw)
+{
+    const v_float64x2 v_M0 = v_setall_f64(M[0]);
+    const v_float64x2 v_M3 = v_setall_f64(M[3]);
+    const v_float64x2 v_M6 = v_setall_f64(M[6]);
+    const v_float64x2 v_intmax = v_setall_f64((double)INT_MAX);
+    const v_float64x2 v_intmin = v_setall_f64((double)INT_MIN);
+    const v_float64x2 v_2 = v_setall_f64(2.0);
+    const v_float64x2 v_zero = v_setzero_f64();
+    const v_float64x2 v_its = v_setall_f64((double)INTER_TAB_SIZE);
+    const v_int32x4 v_itsi1 = v_setall_s32(INTER_TAB_SIZE - 1);
+
+    int x1 = 0;
+
+    v_float64x2 v_X0d = v_setall_f64(X0);
+    v_float64x2 v_Y0d = v_setall_f64(Y0);
+    v_float64x2 v_W0 = v_setall_f64(W0);
+    v_float64x2 v_x1(0.0, 1.0);
+
+    for (; x1 <= bw - 16; x1 += 16)
+    {
+        // 0-3
+        v_int32x4 v_X0, v_Y0;
+        {
+            v_float64x2 v_W = v_muladd(v_M6, v_x1, v_W0);
+            v_W = v_select(v_W != v_zero, v_its / v_W, v_zero);
+            v_float64x2 v_fX0 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M0, v_x1, v_X0d) * v_W));
+            v_float64x2 v_fY0 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M3, v_x1, v_Y0d) * v_W));
+            v_x1 += v_2;
+
+            v_W = v_muladd(v_M6, v_x1, v_W0);
+            v_W = v_select(v_W != v_zero, v_its / v_W, v_zero);
+            v_float64x2 v_fX1 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M0, v_x1, v_X0d) * v_W));
+            v_float64x2 v_fY1 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M3, v_x1, v_Y0d) * v_W));
+            v_x1 += v_2;
+
+            v_X0 = v_round(v_fX0, v_fX1);
+            v_Y0 = v_round(v_fY0, v_fY1);
+        }
+
+        // 4-7
+        v_int32x4 v_X1, v_Y1;
+        {
+            v_float64x2 v_W = v_muladd(v_M6, v_x1, v_W0);
+            v_W = v_select(v_W != v_zero, v_its / v_W, v_zero);
+            v_float64x2 v_fX0 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M0, v_x1, v_X0d) * v_W));
+            v_float64x2 v_fY0 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M3, v_x1, v_Y0d) * v_W));
+            v_x1 += v_2;
+
+            v_W = v_muladd(v_M6, v_x1, v_W0);
+            v_W = v_select(v_W != v_zero, v_its / v_W, v_zero);
+            v_float64x2 v_fX1 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M0, v_x1, v_X0d) * v_W));
+            v_float64x2 v_fY1 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M3, v_x1, v_Y0d) * v_W));
+            v_x1 += v_2;
+
+            v_X1 = v_round(v_fX0, v_fX1);
+            v_Y1 = v_round(v_fY0, v_fY1);
+        }
+
+        // 8-11
+        v_int32x4 v_X2, v_Y2;
+        {
+            v_float64x2 v_W = v_muladd(v_M6, v_x1, v_W0);
+            v_W = v_select(v_W != v_zero, v_its / v_W, v_zero);
+            v_float64x2 v_fX0 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M0, v_x1, v_X0d) * v_W));
+            v_float64x2 v_fY0 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M3, v_x1, v_Y0d) * v_W));
+            v_x1 += v_2;
+
+            v_W = v_muladd(v_M6, v_x1, v_W0);
+            v_W = v_select(v_W != v_zero, v_its / v_W, v_zero);
+            v_float64x2 v_fX1 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M0, v_x1, v_X0d) * v_W));
+            v_float64x2 v_fY1 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M3, v_x1, v_Y0d) * v_W));
+            v_x1 += v_2;
+
+            v_X2 = v_round(v_fX0, v_fX1);
+            v_Y2 = v_round(v_fY0, v_fY1);
+        }
+
+        // 12-15
+        v_int32x4 v_X3, v_Y3;
+        {
+            v_float64x2 v_W = v_muladd(v_M6, v_x1, v_W0);
+            v_W = v_select(v_W != v_zero, v_its / v_W, v_zero);
+            v_float64x2 v_fX0 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M0, v_x1, v_X0d) * v_W));
+            v_float64x2 v_fY0 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M3, v_x1, v_Y0d) * v_W));
+            v_x1 += v_2;
+
+            v_W = v_muladd(v_M6, v_x1, v_W0);
+            v_W = v_select(v_W != v_zero, v_its / v_W, v_zero);
+            v_float64x2 v_fX1 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M0, v_x1, v_X0d) * v_W));
+            v_float64x2 v_fY1 = v_max(v_intmin, v_min(v_intmax, v_muladd(v_M3, v_x1, v_Y0d) * v_W));
+            v_x1 += v_2;
+
+            v_X3 = v_round(v_fX0, v_fX1);
+            v_Y3 = v_round(v_fY0, v_fY1);
+        }
+
+        // store alpha
+        v_int32x4 v_alpha0 = ((v_Y0 & v_itsi1) << INTER_BITS) + (v_X0 & v_itsi1);
+        v_int32x4 v_alpha1 = ((v_Y1 & v_itsi1) << INTER_BITS) + (v_X1 & v_itsi1);
+        v_store((alpha + x1), v_pack(v_alpha0, v_alpha1));
+
+        v_alpha0 = ((v_Y2 & v_itsi1) << INTER_BITS) + (v_X2 & v_itsi1);
+        v_alpha1 = ((v_Y3 & v_itsi1) << INTER_BITS) + (v_X3 & v_itsi1);
+        v_store((alpha + x1 + 8), v_pack(v_alpha0, v_alpha1));
+
+        // convert to 16s
+        v_X0 = v_reinterpret_as_s32(v_pack(v_X0 >> INTER_BITS, v_X1 >> INTER_BITS));
+        v_X1 = v_reinterpret_as_s32(v_pack(v_X2 >> INTER_BITS, v_X3 >> INTER_BITS));
+        v_Y0 = v_reinterpret_as_s32(v_pack(v_Y0 >> INTER_BITS, v_Y1 >> INTER_BITS));
+        v_Y1 = v_reinterpret_as_s32(v_pack(v_Y2 >> INTER_BITS, v_Y3 >> INTER_BITS));
+
+        v_store_interleave(xy + x1 * 2, (v_reinterpret_as_s16)(v_X0), (v_reinterpret_as_s16)(v_Y0));
+        v_store_interleave(xy + x1 * 2 + 16, (v_reinterpret_as_s16)(v_X1), (v_reinterpret_as_s16)(v_Y1));
+    }
+
+    for( ; x1 < bw; x1++ )
+    {
+        double W = W0 + M[6]*x1;
+        W = W ? INTER_TAB_SIZE/W : 0;
+        double fX = std::max((double)INT_MIN, std::min((double)INT_MAX, (X0 + M[0]*x1)*W));
+        double fY = std::max((double)INT_MIN, std::min((double)INT_MAX, (Y0 + M[3]*x1)*W));
+        int X = saturate_cast<int>(fX);
+        int Y = saturate_cast<int>(fY);
+
+        xy[x1*2] = saturate_cast<short>(X >> INTER_BITS);
+        xy[x1*2+1] = saturate_cast<short>(Y >> INTER_BITS);
+        alpha[x1] = (short)((Y & (INTER_TAB_SIZE-1))*INTER_TAB_SIZE +
+                            (X & (INTER_TAB_SIZE-1)));
+    }
+}
+#endif
+
+class WarpPerspectiveInvoker :
     public ParallelLoopBody
 {
 public:
-
-    warpPerspectiveInvoker(const Mat &_src, Mat &_dst, double *_M, int _interpolation,
+    WarpPerspectiveInvoker(const Mat &_src, Mat &_dst, const double *_M, int _interpolation,
                            int _borderType, const Scalar &_borderValue) :
         ParallelLoopBody(), src(_src), dst(_dst), M(_M), interpolation(_interpolation),
         borderType(_borderType), borderValue(_borderValue)
     {
+#if defined(_MSC_VER) && _MSC_VER == 1800 /* MSVS 2013 */ && CV_AVX
+        // details: https://github.com/opencv/opencv/issues/11026
+        borderValue.val[2] = _borderValue.val[2];
+        borderValue.val[3] = _borderValue.val[3];
+#endif
     }
 
-    virtual void operator() (const Range& range) const
+    virtual void operator() (const Range& range) const CV_OVERRIDE
     {
         const int BLOCK_SZ = 32;
         short XY[BLOCK_SZ*BLOCK_SZ*2], A[BLOCK_SZ*BLOCK_SZ];
-        int x, y, x1, y1, width = dst.cols, height = dst.rows;
+        int x, y, y1, width = dst.cols, height = dst.rows;
 
         int bh0 = std::min(BLOCK_SZ/2, height);
         int bw0 = std::min(BLOCK_SZ*BLOCK_SZ/bh0, width);
         bh0 = std::min(BLOCK_SZ*BLOCK_SZ/bw0, height);
+
+        #if CV_TRY_SSE4_1
+        Ptr<opt_SSE4_1::WarpPerspectiveLine_SSE4> pwarp_impl_sse4;
+        if(CV_CPU_HAS_SUPPORT_SSE4_1)
+            pwarp_impl_sse4 = opt_SSE4_1::WarpPerspectiveLine_SSE4::getImpl(M);
+        #endif
 
         for( y = range.start; y < range.end; y += bh0 )
         {
@@ -3361,7 +2990,16 @@ public:
                     double W0 = M[6]*x + M[7]*(y + y1) + M[8];
 
                     if( interpolation == INTER_NEAREST )
-                        for( x1 = 0; x1 < bw; x1++ )
+                    {
+                        #if CV_TRY_SSE4_1
+                        if (pwarp_impl_sse4)
+                            pwarp_impl_sse4->processNN(M, xy, X0, Y0, W0, bw);
+                        else
+                        #endif
+                        #if CV_SIMD128_64F
+                        WarpPerspectiveLine_ProcessNN_CV_SIMD(M, xy, X0, Y0, W0, bw);
+                        #else
+                        for( int x1 = 0; x1 < bw; x1++ )
                         {
                             double W = W0 + M[6]*x1;
                             W = W ? 1./W : 0;
@@ -3373,10 +3011,21 @@ public:
                             xy[x1*2] = saturate_cast<short>(X);
                             xy[x1*2+1] = saturate_cast<short>(Y);
                         }
+                        #endif
+                    }
                     else
                     {
                         short* alpha = A + y1*bw;
-                        for( x1 = 0; x1 < bw; x1++ )
+
+                        #if CV_TRY_SSE4_1
+                        if (pwarp_impl_sse4)
+                            pwarp_impl_sse4->process(M, xy, alpha, X0, Y0, W0, bw);
+                        else
+                        #endif
+                        #if CV_SIMD128_64F
+                        WarpPerspectiveLine_Process_CV_SIMD(M, xy, alpha, X0, Y0, W0, bw);
+                        #else
+                        for( int x1 = 0; x1 < bw; x1++ )
                         {
                             double W = W0 + M[6]*x1;
                             W = W ? INTER_TAB_SIZE/W : 0;
@@ -3390,6 +3039,7 @@ public:
                             alpha[x1] = (short)((Y & (INTER_TAB_SIZE-1))*INTER_TAB_SIZE +
                                                 (X & (INTER_TAB_SIZE-1)));
                         }
+                        #endif
                     }
                 }
 
@@ -3407,21 +3057,105 @@ public:
 private:
     Mat src;
     Mat dst;
-    double* M;
+    const double* M;
     int interpolation, borderType;
     Scalar borderValue;
 };
 
+#if defined (HAVE_IPP) && IPP_VERSION_X100 >= 810 && !IPP_DISABLE_WARPPERSPECTIVE
+typedef IppStatus (CV_STDCALL* ippiWarpPerspectiveFunc)(const void*, IppiSize, int, IppiRect, void *, int, IppiRect, double [3][3], int);
+
+class IPPWarpPerspectiveInvoker :
+    public ParallelLoopBody
+{
+public:
+    IPPWarpPerspectiveInvoker(Mat &_src, Mat &_dst, double (&_coeffs)[3][3], int &_interpolation,
+                              int &_borderType, const Scalar &_borderValue, ippiWarpPerspectiveFunc _func, bool *_ok) :
+        ParallelLoopBody(), src(_src), dst(_dst), mode(_interpolation), coeffs(_coeffs),
+        borderType(_borderType), borderValue(_borderValue), func(_func), ok(_ok)
+    {
+        *ok = true;
+    }
+
+    virtual void operator() (const Range& range) const CV_OVERRIDE
+    {
+        IppiSize srcsize = {src.cols, src.rows};
+        IppiRect srcroi = {0, 0, src.cols, src.rows};
+        IppiRect dstroi = {0, range.start, dst.cols, range.end - range.start};
+        int cnn = src.channels();
+
+        if( borderType == BORDER_CONSTANT )
+        {
+            IppiSize setSize = {dst.cols, range.end - range.start};
+            void *dataPointer = dst.ptr(range.start);
+            if( !IPPSet( borderValue, dataPointer, (int)dst.step[0], setSize, cnn, src.depth() ) )
+            {
+                *ok = false;
+                return;
+            }
+        }
+
+        IppStatus status = CV_INSTRUMENT_FUN_IPP(func,(src.ptr();, srcsize, (int)src.step[0], srcroi, dst.ptr(), (int)dst.step[0], dstroi, coeffs, mode));
+        if (status != ippStsNoErr)
+            *ok = false;
+        else
+        {
+            CV_IMPL_ADD(CV_IMPL_IPP|CV_IMPL_MT);
+        }
+    }
+private:
+    Mat &src;
+    Mat &dst;
+    int mode;
+    double (&coeffs)[3][3];
+    int borderType;
+    const Scalar borderValue;
+    ippiWarpPerspectiveFunc func;
+    bool *ok;
+
+    const IPPWarpPerspectiveInvoker& operator= (const IPPWarpPerspectiveInvoker&);
+};
+#endif
+
+namespace hal {
+
+void warpPerspective(int src_type,
+                    const uchar * src_data, size_t src_step, int src_width, int src_height,
+                    uchar * dst_data, size_t dst_step, int dst_width, int dst_height,
+                    const double M[9], int interpolation, int borderType, const double borderValue[4])
+{
+    CALL_HAL(warpPerspective, cv_hal_warpPerspective, src_type, src_data, src_step, src_width, src_height, dst_data, dst_step, dst_width, dst_height, M, interpolation, borderType, borderValue);
+    Mat src(Size(src_width, src_height), src_type, const_cast<uchar*>(src_data), src_step);
+    Mat dst(Size(dst_width, dst_height), src_type, dst_data, dst_step);
+
+    Range range(0, dst.rows);
+    WarpPerspectiveInvoker invoker(src, dst, M, interpolation, borderType, Scalar(borderValue[0], borderValue[1], borderValue[2], borderValue[3]));
+    parallel_for_(range, invoker, dst.total()/(double)(1<<16));
 }
+
+} // hal::
+} // cv::
 
 void cv::warpPerspective( InputArray _src, OutputArray _dst, InputArray _M0,
                           Size dsize, int flags, int borderType, const Scalar& borderValue )
 {
+    CV_INSTRUMENT_REGION();
+
+    CV_Assert( _src.total() > 0 );
+
+    CV_OCL_RUN(_src.dims() <= 2 && _dst.isUMat() &&
+               _src.cols() <= SHRT_MAX && _src.rows() <= SHRT_MAX,
+               ocl_warpTransform_cols4(_src, _dst, _M0, dsize, flags, borderType, borderValue,
+                                       OCL_OP_PERSPECTIVE))
+
+    CV_OCL_RUN(_src.dims() <= 2 && _dst.isUMat(),
+               ocl_warpTransform(_src, _dst, _M0, dsize, flags, borderType, borderValue,
+                              OCL_OP_PERSPECTIVE))
+
     Mat src = _src.getMat(), M0 = _M0.getMat();
-    _dst.create( dsize.area() == 0 ? src.size() : dsize, src.type() );
+    _dst.create( dsize.empty() ? src.size() : dsize, src.type() );
     Mat dst = _dst.getMat();
 
-    CV_Assert( src.cols > 0 && src.rows > 0 );
     if( dst.data == src.data )
         src = src.clone();
 
@@ -3434,36 +3168,85 @@ void cv::warpPerspective( InputArray _src, OutputArray _dst, InputArray _M0,
     CV_Assert( (M0.type() == CV_32F || M0.type() == CV_64F) && M0.rows == 3 && M0.cols == 3 );
     M0.convertTo(matM, matM.type());
 
-#ifdef HAVE_TEGRA_OPTIMIZATION
-    if( tegra::warpPerspective(src, dst, M, flags, borderType, borderValue) )
-        return;
+#if defined (HAVE_IPP) && IPP_VERSION_X100 >= 810 && !IPP_DISABLE_WARPPERSPECTIVE
+    CV_IPP_CHECK()
+    {
+        int type = src.type(), depth = CV_MAT_DEPTH(type), cn = CV_MAT_CN(type);
+        if( (depth == CV_8U || depth == CV_16U || depth == CV_32F) &&
+           (cn == 1 || cn == 3 || cn == 4) &&
+           ( borderType == cv::BORDER_TRANSPARENT || borderType == cv::BORDER_CONSTANT ) &&
+           (interpolation == INTER_NEAREST || interpolation == INTER_LINEAR || interpolation == INTER_CUBIC))
+        {
+            ippiWarpPerspectiveFunc ippFunc = 0;
+            if ((flags & WARP_INVERSE_MAP) != 0)
+            {
+                ippFunc = type == CV_8UC1 ? (ippiWarpPerspectiveFunc)ippiWarpPerspectiveBack_8u_C1R :
+                type == CV_8UC3 ? (ippiWarpPerspectiveFunc)ippiWarpPerspectiveBack_8u_C3R :
+                type == CV_8UC4 ? (ippiWarpPerspectiveFunc)ippiWarpPerspectiveBack_8u_C4R :
+                type == CV_16UC1 ? (ippiWarpPerspectiveFunc)ippiWarpPerspectiveBack_16u_C1R :
+                type == CV_16UC3 ? (ippiWarpPerspectiveFunc)ippiWarpPerspectiveBack_16u_C3R :
+                type == CV_16UC4 ? (ippiWarpPerspectiveFunc)ippiWarpPerspectiveBack_16u_C4R :
+                type == CV_32FC1 ? (ippiWarpPerspectiveFunc)ippiWarpPerspectiveBack_32f_C1R :
+                type == CV_32FC3 ? (ippiWarpPerspectiveFunc)ippiWarpPerspectiveBack_32f_C3R :
+                type == CV_32FC4 ? (ippiWarpPerspectiveFunc)ippiWarpPerspectiveBack_32f_C4R : 0;
+            }
+            else
+            {
+                ippFunc = type == CV_8UC1 ? (ippiWarpPerspectiveFunc)ippiWarpPerspective_8u_C1R :
+                type == CV_8UC3 ? (ippiWarpPerspectiveFunc)ippiWarpPerspective_8u_C3R :
+                type == CV_8UC4 ? (ippiWarpPerspectiveFunc)ippiWarpPerspective_8u_C4R :
+                type == CV_16UC1 ? (ippiWarpPerspectiveFunc)ippiWarpPerspective_16u_C1R :
+                type == CV_16UC3 ? (ippiWarpPerspectiveFunc)ippiWarpPerspective_16u_C3R :
+                type == CV_16UC4 ? (ippiWarpPerspectiveFunc)ippiWarpPerspective_16u_C4R :
+                type == CV_32FC1 ? (ippiWarpPerspectiveFunc)ippiWarpPerspective_32f_C1R :
+                type == CV_32FC3 ? (ippiWarpPerspectiveFunc)ippiWarpPerspective_32f_C3R :
+                type == CV_32FC4 ? (ippiWarpPerspectiveFunc)ippiWarpPerspective_32f_C4R : 0;
+            }
+            int mode =
+            interpolation == INTER_NEAREST ? IPPI_INTER_NN :
+            interpolation == INTER_LINEAR ? IPPI_INTER_LINEAR :
+            interpolation == INTER_CUBIC ? IPPI_INTER_CUBIC : 0;
+            CV_Assert(mode && ippFunc);
+
+            double coeffs[3][3];
+            for( int i = 0; i < 3; i++ )
+                for( int j = 0; j < 3; j++ )
+                    coeffs[i][j] = matM.at<double>(i, j);
+
+            bool ok;
+            Range range(0, dst.rows);
+            IPPWarpPerspectiveInvoker invoker(src, dst, coeffs, mode, borderType, borderValue, ippFunc, &ok);
+            parallel_for_(range, invoker, dst.total()/(double)(1<<16));
+            if( ok )
+            {
+                CV_IMPL_ADD(CV_IMPL_IPP|CV_IMPL_MT);
+                return;
+            }
+            setIppErrorStatus();
+        }
+    }
 #endif
 
     if( !(flags & WARP_INVERSE_MAP) )
-         invert(matM, matM);
+        invert(matM, matM);
 
-    Range range(0, dst.rows);
-    warpPerspectiveInvoker invoker(src, dst, M, interpolation, borderType, borderValue);
-    parallel_for_(range, invoker, dst.total()/(double)(1<<16));
+    hal::warpPerspective(src.type(), src.data, src.step, src.cols, src.rows, dst.data, dst.step, dst.cols, dst.rows,
+                        matM.ptr<double>(), interpolation, borderType, borderValue.val);
 }
 
 
-cv::Mat cv::getRotationMatrix2D( Point2f center, double angle, double scale )
+cv::Matx23d cv::getRotationMatrix2D_(Point2f center, double angle, double scale)
 {
+    CV_INSTRUMENT_REGION();
+
     angle *= CV_PI/180;
-    double alpha = cos(angle)*scale;
-    double beta = sin(angle)*scale;
+    double alpha = std::cos(angle)*scale;
+    double beta = std::sin(angle)*scale;
 
-    Mat M(2, 3, CV_64F);
-    double* m = (double*)M.data;
-
-    m[0] = alpha;
-    m[1] = beta;
-    m[2] = (1-alpha)*center.x - beta*center.y;
-    m[3] = -beta;
-    m[4] = alpha;
-    m[5] = beta*center.x + (1-alpha)*center.y;
-
+    Matx23d M(
+        alpha, beta, (1-alpha)*center.x - beta*center.y,
+        -beta, alpha, beta*center.x + (1-alpha)*center.y
+    );
     return M;
 }
 
@@ -3491,9 +3274,11 @@ cv::Mat cv::getRotationMatrix2D( Point2f center, double angle, double scale )
  * where:
  *   cij - matrix coefficients, c22 = 1
  */
-cv::Mat cv::getPerspectiveTransform( const Point2f src[], const Point2f dst[] )
+cv::Mat cv::getPerspectiveTransform(const Point2f src[], const Point2f dst[], int solveMethod)
 {
-    Mat M(3, 3, CV_64F), X(8, 1, CV_64F, M.data);
+    CV_INSTRUMENT_REGION();
+
+    Mat M(3, 3, CV_64F), X(8, 1, CV_64F, M.ptr());
     double a[8][8], b[8];
     Mat A(8, 8, CV_64F, a), B(8, 1, CV_64F, b);
 
@@ -3512,8 +3297,8 @@ cv::Mat cv::getPerspectiveTransform( const Point2f src[], const Point2f dst[] )
         b[i+4] = dst[i].y;
     }
 
-    solve( A, B, X, DECOMP_SVD );
-    ((double*)M.data)[8] = 1.;
+    solve(A, B, X, solveMethod);
+    M.ptr<double>()[8] = 1.;
 
     return M;
 }
@@ -3539,7 +3324,7 @@ cv::Mat cv::getPerspectiveTransform( const Point2f src[], const Point2f dst[] )
 
 cv::Mat cv::getAffineTransform( const Point2f src[], const Point2f dst[] )
 {
-    Mat M(2, 3, CV_64F), X(6, 1, CV_64F, M.data);
+    Mat M(2, 3, CV_64F), X(6, 1, CV_64F, M.ptr());
     double a[6*6], b[6];
     Mat A(6, 6, CV_64F, a), B(6, 1, CV_64F, b);
 
@@ -3569,30 +3354,30 @@ void cv::invertAffineTransform(InputArray _matM, OutputArray __iM)
 
     if( matM.type() == CV_32F )
     {
-        const float* M = (const float*)matM.data;
-        float* iM = (float*)_iM.data;
+        const softfloat* M = matM.ptr<softfloat>();
+        softfloat* iM = _iM.ptr<softfloat>();
         int step = (int)(matM.step/sizeof(M[0])), istep = (int)(_iM.step/sizeof(iM[0]));
 
-        double D = M[0]*M[step+1] - M[1]*M[step];
-        D = D != 0 ? 1./D : 0;
-        double A11 = M[step+1]*D, A22 = M[0]*D, A12 = -M[1]*D, A21 = -M[step]*D;
-        double b1 = -A11*M[2] - A12*M[step+2];
-        double b2 = -A21*M[2] - A22*M[step+2];
+        softdouble D = M[0]*M[step+1] - M[1]*M[step];
+        D = D != 0. ? softdouble(1.)/D : softdouble(0.);
+        softdouble A11 = M[step+1]*D, A22 = M[0]*D, A12 = -M[1]*D, A21 = -M[step]*D;
+        softdouble b1 = -A11*M[2] - A12*M[step+2];
+        softdouble b2 = -A21*M[2] - A22*M[step+2];
 
-        iM[0] = (float)A11; iM[1] = (float)A12; iM[2] = (float)b1;
-        iM[istep] = (float)A21; iM[istep+1] = (float)A22; iM[istep+2] = (float)b2;
+        iM[0] = A11; iM[1] = A12; iM[2] = b1;
+        iM[istep] = A21; iM[istep+1] = A22; iM[istep+2] = b2;
     }
     else if( matM.type() == CV_64F )
     {
-        const double* M = (const double*)matM.data;
-        double* iM = (double*)_iM.data;
+        const softdouble* M = matM.ptr<softdouble>();
+        softdouble* iM = _iM.ptr<softdouble>();
         int step = (int)(matM.step/sizeof(M[0])), istep = (int)(_iM.step/sizeof(iM[0]));
 
-        double D = M[0]*M[step+1] - M[1]*M[step];
-        D = D != 0 ? 1./D : 0;
-        double A11 = M[step+1]*D, A22 = M[0]*D, A12 = -M[1]*D, A21 = -M[step]*D;
-        double b1 = -A11*M[2] - A12*M[step+2];
-        double b2 = -A21*M[2] - A22*M[step+2];
+        softdouble D = M[0]*M[step+1] - M[1]*M[step];
+        D = D != 0. ? softdouble(1.)/D : softdouble(0.);
+        softdouble A11 = M[step+1]*D, A22 = M[0]*D, A12 = -M[1]*D, A21 = -M[step]*D;
+        softdouble b1 = -A11*M[2] - A12*M[step+2];
+        softdouble b2 = -A21*M[2] - A22*M[step+2];
 
         iM[0] = A11; iM[1] = A12; iM[2] = b1;
         iM[istep] = A21; iM[istep+1] = A22; iM[istep+2] = b2;
@@ -3601,11 +3386,11 @@ void cv::invertAffineTransform(InputArray _matM, OutputArray __iM)
         CV_Error( CV_StsUnsupportedFormat, "" );
 }
 
-cv::Mat cv::getPerspectiveTransform(InputArray _src, InputArray _dst)
+cv::Mat cv::getPerspectiveTransform(InputArray _src, InputArray _dst, int solveMethod)
 {
     Mat src = _src.getMat(), dst = _dst.getMat();
     CV_Assert(src.checkVector(2, CV_32F) == 4 && dst.checkVector(2, CV_32F) == 4);
-    return getPerspectiveTransform((const Point2f*)src.data, (const Point2f*)dst.data);
+    return getPerspectiveTransform((const Point2f*)src.data, (const Point2f*)dst.data, solveMethod);
 }
 
 cv::Mat cv::getAffineTransform(InputArray _src, InputArray _dst)
@@ -3614,16 +3399,6 @@ cv::Mat cv::getAffineTransform(InputArray _src, InputArray _dst)
     CV_Assert(src.checkVector(2, CV_32F) == 3 && dst.checkVector(2, CV_32F) == 3);
     return getAffineTransform((const Point2f*)src.data, (const Point2f*)dst.data);
 }
-
-CV_IMPL void
-cvResize( const CvArr* srcarr, CvArr* dstarr, int method )
-{
-    cv::Mat src = cv::cvarrToMat(srcarr), dst = cv::cvarrToMat(dstarr);
-    CV_Assert( src.type() == dst.type() );
-    cv::resize( src, dst, dst.size(), (double)dst.cols/src.cols,
-        (double)dst.rows/src.rows, method );
-}
-
 
 CV_IMPL void
 cvWarpAffine( const CvArr* srcarr, CvArr* dstarr, const CvMat* marr,
@@ -3669,7 +3444,7 @@ cv2DRotationMatrix( CvPoint2D32f center, double angle,
                     double scale, CvMat* matrix )
 {
     cv::Mat M0 = cv::cvarrToMat(matrix), M = cv::getRotationMatrix2D(center, angle, scale);
-    CV_Assert( M.size() == M.size() );
+    CV_Assert( M.size() == M0.size() );
     M.convertTo(M0, M0.type());
     return matrix;
 }
@@ -3682,7 +3457,7 @@ cvGetPerspectiveTransform( const CvPoint2D32f* src,
 {
     cv::Mat M0 = cv::cvarrToMat(matrix),
         M = cv::getPerspectiveTransform((const cv::Point2f*)src, (const cv::Point2f*)dst);
-    CV_Assert( M.size() == M.size() );
+    CV_Assert( M.size() == M0.size() );
     M.convertTo(M0, M0.type());
     return matrix;
 }
@@ -3713,223 +3488,170 @@ cvConvertMaps( const CvArr* arr1, const CvArr* arr2, CvArr* dstarr1, CvArr* dsta
     {
         dstmap2 = cv::cvarrToMat(dstarr2);
         if( dstmap2.type() == CV_16SC1 )
-            dstmap2 = cv::Mat(dstmap2.size(), CV_16UC1, dstmap2.data, dstmap2.step);
+            dstmap2 = cv::Mat(dstmap2.size(), CV_16UC1, dstmap2.ptr(), dstmap2.step);
     }
 
     cv::convertMaps( map1, map2, dstmap1, dstmap2, dstmap1.type(), false );
 }
 
-/****************************************************************************************\
-*                                   Log-Polar Transform                                  *
-\****************************************************************************************/
-
-/* now it is done via Remap; more correct implementation should use
-   some super-sampling technique outside of the "fovea" circle */
-CV_IMPL void
-cvLogPolar( const CvArr* srcarr, CvArr* dstarr,
-            CvPoint2D32f center, double M, int flags )
+/****************************************************************************************
+PkLab.net 2018 based on cv::linearPolar from OpenCV by J.L. Blanco, Apr 2009
+****************************************************************************************/
+void cv::warpPolar(InputArray _src, OutputArray _dst, Size dsize,
+                   Point2f center, double maxRadius, int flags)
 {
-    cv::Ptr<CvMat> mapx, mapy;
-
-    CvMat srcstub, *src = cvGetMat(srcarr, &srcstub);
-    CvMat dststub, *dst = cvGetMat(dstarr, &dststub);
-    CvSize ssize, dsize;
-
-    if( !CV_ARE_TYPES_EQ( src, dst ))
-        CV_Error( CV_StsUnmatchedFormats, "" );
-
-    if( M <= 0 )
-        CV_Error( CV_StsOutOfRange, "M should be >0" );
-
-    ssize = cvGetMatSize(src);
-    dsize = cvGetMatSize(dst);
-
-    mapx = cvCreateMat( dsize.height, dsize.width, CV_32F );
-    mapy = cvCreateMat( dsize.height, dsize.width, CV_32F );
-
-    if( !(flags & CV_WARP_INVERSE_MAP) )
+    // if dest size is empty given than calculate using proportional setting
+    // thus we calculate needed angles to keep same area as bounding circle
+    if ((dsize.width <= 0) && (dsize.height <= 0))
     {
+        dsize.width = cvRound(maxRadius);
+        dsize.height = cvRound(maxRadius * CV_PI);
+    }
+    else if (dsize.height <= 0)
+    {
+        dsize.height = cvRound(dsize.width * CV_PI);
+    }
+
+    Mat mapx, mapy;
+    mapx.create(dsize, CV_32F);
+    mapy.create(dsize, CV_32F);
+    bool semiLog = (flags & WARP_POLAR_LOG) != 0;
+
+    if (!(flags & CV_WARP_INVERSE_MAP))
+    {
+        CV_Assert(!dsize.empty());
+        double Kangle = CV_2PI / dsize.height;
         int phi, rho;
-        cv::AutoBuffer<double> _exp_tab(dsize.width);
-        double* exp_tab = _exp_tab;
 
-        for( rho = 0; rho < dst->width; rho++ )
-            exp_tab[rho] = std::exp(rho/M);
-
-        for( phi = 0; phi < dsize.height; phi++ )
+        // precalculate scaled rho
+        Mat rhos = Mat(1, dsize.width, CV_32F);
+        float* bufRhos = (float*)(rhos.data);
+        if (semiLog)
         {
-            double cp = cos(phi*2*CV_PI/dsize.height);
-            double sp = sin(phi*2*CV_PI/dsize.height);
-            float* mx = (float*)(mapx->data.ptr + phi*mapx->step);
-            float* my = (float*)(mapy->data.ptr + phi*mapy->step);
+            double Kmag = std::log(maxRadius) / dsize.width;
+            for (rho = 0; rho < dsize.width; rho++)
+                bufRhos[rho] = (float)(std::exp(rho * Kmag) - 1.0);
 
-            for( rho = 0; rho < dsize.width; rho++ )
+        }
+        else
+        {
+            double Kmag = maxRadius / dsize.width;
+            for (rho = 0; rho < dsize.width; rho++)
+                bufRhos[rho] = (float)(rho * Kmag);
+        }
+
+        for (phi = 0; phi < dsize.height; phi++)
+        {
+            double KKy = Kangle * phi;
+            double cp = std::cos(KKy);
+            double sp = std::sin(KKy);
+            float* mx = (float*)(mapx.data + phi*mapx.step);
+            float* my = (float*)(mapy.data + phi*mapy.step);
+
+            for (rho = 0; rho < dsize.width; rho++)
             {
-                double r = exp_tab[rho];
-                double x = r*cp + center.x;
-                double y = r*sp + center.y;
+                double x = bufRhos[rho] * cp + center.x;
+                double y = bufRhos[rho] * sp + center.y;
 
                 mx[rho] = (float)x;
                 my[rho] = (float)y;
             }
         }
+        remap(_src, _dst, mapx, mapy, flags & cv::INTER_MAX, (flags & CV_WARP_FILL_OUTLIERS) ? cv::BORDER_CONSTANT : cv::BORDER_TRANSPARENT);
     }
     else
     {
+        const int ANGLE_BORDER = 1;
+        cv::copyMakeBorder(_src, _dst, ANGLE_BORDER, ANGLE_BORDER, 0, 0, BORDER_WRAP);
+        Mat src = _dst.getMat();
+        Size ssize = _dst.size();
+        ssize.height -= 2 * ANGLE_BORDER;
+        CV_Assert(!ssize.empty());
+        const double Kangle = CV_2PI / ssize.height;
+        double Kmag;
+        if (semiLog)
+            Kmag = std::log(maxRadius) / ssize.width;
+        else
+            Kmag = maxRadius / ssize.width;
+
         int x, y;
-        CvMat bufx, bufy, bufp, bufa;
-        double ascale = ssize.height/(2*CV_PI);
-        cv::AutoBuffer<float> _buf(4*dsize.width);
-        float* buf = _buf;
+        Mat bufx, bufy, bufp, bufa;
 
-        bufx = cvMat( 1, dsize.width, CV_32F, buf );
-        bufy = cvMat( 1, dsize.width, CV_32F, buf + dsize.width );
-        bufp = cvMat( 1, dsize.width, CV_32F, buf + dsize.width*2 );
-        bufa = cvMat( 1, dsize.width, CV_32F, buf + dsize.width*3 );
+        bufx = Mat(1, dsize.width, CV_32F);
+        bufy = Mat(1, dsize.width, CV_32F);
+        bufp = Mat(1, dsize.width, CV_32F);
+        bufa = Mat(1, dsize.width, CV_32F);
 
-        for( x = 0; x < dsize.width; x++ )
-            bufx.data.fl[x] = (float)x - center.x;
+        for (x = 0; x < dsize.width; x++)
+            bufx.at<float>(0, x) = (float)x - center.x;
 
-        for( y = 0; y < dsize.height; y++ )
+        for (y = 0; y < dsize.height; y++)
         {
-            float* mx = (float*)(mapx->data.ptr + y*mapx->step);
-            float* my = (float*)(mapy->data.ptr + y*mapy->step);
+            float* mx = (float*)(mapx.data + y*mapx.step);
+            float* my = (float*)(mapy.data + y*mapy.step);
 
-            for( x = 0; x < dsize.width; x++ )
-                bufy.data.fl[x] = (float)y - center.y;
+            for (x = 0; x < dsize.width; x++)
+                bufy.at<float>(0, x) = (float)y - center.y;
 
-#if 1
-            cvCartToPolar( &bufx, &bufy, &bufp, &bufa );
+            cartToPolar(bufx, bufy, bufp, bufa, 0);
 
-            for( x = 0; x < dsize.width; x++ )
-                bufp.data.fl[x] += 1.f;
-
-            cvLog( &bufp, &bufp );
-
-            for( x = 0; x < dsize.width; x++ )
+            if (semiLog)
             {
-                double rho = bufp.data.fl[x]*M;
-                double phi = bufa.data.fl[x]*ascale;
+                bufp += 1.f;
+                log(bufp, bufp);
+            }
 
+            for (x = 0; x < dsize.width; x++)
+            {
+                double rho = bufp.at<float>(0, x) / Kmag;
+                double phi = bufa.at<float>(0, x) / Kangle;
                 mx[x] = (float)rho;
-                my[x] = (float)phi;
+                my[x] = (float)phi + ANGLE_BORDER;
             }
-#else
-            for( x = 0; x < dsize.width; x++ )
-            {
-                double xx = bufx.data.fl[x];
-                double yy = bufy.data.fl[x];
-
-                double p = log(sqrt(xx*xx + yy*yy) + 1.)*M;
-                double a = atan2(yy,xx);
-                if( a < 0 )
-                    a = 2*CV_PI + a;
-                a *= ascale;
-
-                mx[x] = (float)p;
-                my[x] = (float)a;
-            }
-#endif
         }
+        remap(src, _dst, mapx, mapy, flags & cv::INTER_MAX,
+              (flags & CV_WARP_FILL_OUTLIERS) ? cv::BORDER_CONSTANT : cv::BORDER_TRANSPARENT);
     }
-
-    cvRemap( src, dst, mapx, mapy, flags, cvScalarAll(0) );
 }
 
+void cv::linearPolar( InputArray _src, OutputArray _dst,
+                      Point2f center, double maxRadius, int flags )
+{
+    warpPolar(_src, _dst, _src.size(), center, maxRadius, flags & ~WARP_POLAR_LOG);
+}
 
-/****************************************************************************************
-                                   Linear-Polar Transform
-  J.L. Blanco, Apr 2009
- ****************************************************************************************/
+void cv::logPolar( InputArray _src, OutputArray _dst,
+                   Point2f center, double maxRadius, int flags )
+{
+    Size ssize = _src.size();
+    double M = maxRadius > 0 ? std::exp(ssize.width / maxRadius) : 1;
+    warpPolar(_src, _dst, ssize, center, M, flags | WARP_POLAR_LOG);
+}
+
 CV_IMPL
 void cvLinearPolar( const CvArr* srcarr, CvArr* dstarr,
-            CvPoint2D32f center, double maxRadius, int flags )
+                    CvPoint2D32f center, double maxRadius, int flags )
 {
-    cv::Ptr<CvMat> mapx, mapy;
+    Mat src = cvarrToMat(srcarr);
+    Mat dst = cvarrToMat(dstarr);
 
-    CvMat srcstub, *src = (CvMat*)srcarr;
-    CvMat dststub, *dst = (CvMat*)dstarr;
-    CvSize ssize, dsize;
+    CV_Assert(src.size == dst.size);
+    CV_Assert(src.type() == dst.type());
 
-    src = cvGetMat( srcarr, &srcstub,0,0 );
-    dst = cvGetMat( dstarr, &dststub,0,0 );
-
-    if( !CV_ARE_TYPES_EQ( src, dst ))
-        CV_Error( CV_StsUnmatchedFormats, "" );
-
-    ssize.width = src->cols;
-    ssize.height = src->rows;
-    dsize.width = dst->cols;
-    dsize.height = dst->rows;
-
-    mapx = cvCreateMat( dsize.height, dsize.width, CV_32F );
-    mapy = cvCreateMat( dsize.height, dsize.width, CV_32F );
-
-    if( !(flags & CV_WARP_INVERSE_MAP) )
-    {
-        int phi, rho;
-
-        for( phi = 0; phi < dsize.height; phi++ )
-        {
-            double cp = cos(phi*2*CV_PI/dsize.height);
-            double sp = sin(phi*2*CV_PI/dsize.height);
-            float* mx = (float*)(mapx->data.ptr + phi*mapx->step);
-            float* my = (float*)(mapy->data.ptr + phi*mapy->step);
-
-            for( rho = 0; rho < dsize.width; rho++ )
-            {
-                double r = maxRadius*(rho+1)/dsize.width;
-                double x = r*cp + center.x;
-                double y = r*sp + center.y;
-
-                mx[rho] = (float)x;
-                my[rho] = (float)y;
-            }
-        }
-    }
-    else
-    {
-        int x, y;
-        CvMat bufx, bufy, bufp, bufa;
-        const double ascale = ssize.height/(2*CV_PI);
-        const double pscale = ssize.width/maxRadius;
-
-        cv::AutoBuffer<float> _buf(4*dsize.width);
-        float* buf = _buf;
-
-        bufx = cvMat( 1, dsize.width, CV_32F, buf );
-        bufy = cvMat( 1, dsize.width, CV_32F, buf + dsize.width );
-        bufp = cvMat( 1, dsize.width, CV_32F, buf + dsize.width*2 );
-        bufa = cvMat( 1, dsize.width, CV_32F, buf + dsize.width*3 );
-
-        for( x = 0; x < dsize.width; x++ )
-            bufx.data.fl[x] = (float)x - center.x;
-
-        for( y = 0; y < dsize.height; y++ )
-        {
-            float* mx = (float*)(mapx->data.ptr + y*mapx->step);
-            float* my = (float*)(mapy->data.ptr + y*mapy->step);
-
-            for( x = 0; x < dsize.width; x++ )
-                bufy.data.fl[x] = (float)y - center.y;
-
-            cvCartToPolar( &bufx, &bufy, &bufp, &bufa, 0 );
-
-            for( x = 0; x < dsize.width; x++ )
-                bufp.data.fl[x] += 1.f;
-
-            for( x = 0; x < dsize.width; x++ )
-            {
-                double rho = bufp.data.fl[x]*pscale;
-                double phi = bufa.data.fl[x]*ascale;
-                mx[x] = (float)rho;
-                my[x] = (float)phi;
-            }
-        }
-    }
-
-    cvRemap( src, dst, mapx, mapy, flags, cvScalarAll(0) );
+    cv::linearPolar(src, dst, center, maxRadius, flags);
 }
 
+CV_IMPL
+void cvLogPolar( const CvArr* srcarr, CvArr* dstarr,
+                 CvPoint2D32f center, double M, int flags )
+{
+    Mat src = cvarrToMat(srcarr);
+    Mat dst = cvarrToMat(dstarr);
+
+    CV_Assert(src.size == dst.size);
+    CV_Assert(src.type() == dst.type());
+
+    cv::logPolar(src, dst, center, M, flags);
+}
 
 /* End of file. */
